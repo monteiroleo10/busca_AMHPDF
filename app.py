@@ -144,6 +144,48 @@ def login_stealth(page, usuario, senha, log_queue=None):
 
 
 ANTICAPTCHA_KEY_FILE = "/tmp/anticaptcha_key.txt"
+EXTENSION_PATH = "/opt/2captcha-ext/src"
+
+
+def iniciar_xvfb():
+    import subprocess
+    proc = subprocess.Popen(
+        ["Xvfb", ":99", "-screen", "0", "1280x720x24", "-ac"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    os.environ["DISPLAY"] = ":99"
+    time.sleep(1)
+    return proc
+
+
+def configurar_api_key_extensao(context, api_key, log_queue):
+    """Injeta a API key na extensao 2captcha via background page ou service worker."""
+    time.sleep(2)
+    script = "(key) => chrome.storage.local.set({apiKey: key, autoSolve: true, solveRecaptchaV2: true, solveRecaptchaV3: true, solveHCaptcha: true})"
+    try:
+        pages = context.background_pages
+        if not pages:
+            time.sleep(3)
+            pages = context.background_pages
+        if pages:
+            pages[0].evaluate(script, api_key)
+            log_queue.put("  API key configurada na extensao (background page).")
+            return
+    except Exception:
+        pass
+    try:
+        workers = context.service_workers
+        if not workers:
+            time.sleep(3)
+            workers = context.service_workers
+        if workers:
+            workers[0].evaluate(script, api_key)
+            log_queue.put("  API key configurada na extensao (service worker).")
+            return
+    except Exception:
+        pass
+    log_queue.put("  Aviso: nao foi possivel configurar API key automaticamente — verifique se a extensao carregou.")
 
 def salvar_anticaptcha_key(api_key):
     with open(ANTICAPTCHA_KEY_FILE, "w") as f:
@@ -455,66 +497,114 @@ def consolidar_excel(arquivos, usuario):
 
 def rodar_exportacao(usuario, senha, quantidade, cookies_json, api_key, log_queue):
     arquivos_exportados = []
+    xvfb_proc = None
+    usar_extensao = (
+        platform.system() != "Windows"
+        and bool(api_key)
+        and os.path.isdir(EXTENSION_PATH)
+    )
+
     try:
-        # No Windows (exe), localiza o Chromium manualmente
         chromium_exe = encontrar_chromium() if platform.system() == "Windows" else None
+        prefixo_usuario = ''.join(c for c in usuario if c.isdigit())[:6]
 
         log_queue.put("Iniciando navegador...")
         with sync_playwright() as p:
-            if platform.system() == "Windows":
+
+            # ── Lança o navegador correto ──────────────────────────
+            if usar_extensao:
+                log_queue.put("Iniciando display virtual + Chromium com extensao 2captcha...")
+                xvfb_proc = iniciar_xvfb()
+                context = p.chromium.launch_persistent_context(
+                    user_data_dir=f"/tmp/chrome_{prefixo_usuario}",
+                    headless=False,
+                    accept_downloads=True,
+                    args=[
+                        f"--disable-extensions-except={EXTENSION_PATH}",
+                        f"--load-extension={EXTENSION_PATH}",
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                        "--disable-gpu",
+                        "--window-size=1280,720",
+                    ],
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+                )
+                configurar_api_key_extensao(context, api_key, log_queue)
+                browser = None
+            elif platform.system() == "Windows":
                 browser = p.chromium.launch(headless=HEADLESS, executable_path=chromium_exe)
+                context = browser.new_context(
+                    accept_downloads=True,
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+                )
             else:
                 browser = p.firefox.launch(headless=True)
+                context = browser.new_context(
+                    accept_downloads=True,
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
+                )
 
-            context = browser.new_context(
-                accept_downloads=True,
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
-            )
             page = context.new_page()
-
             autenticado = False
 
-            # Tentativa 1: login via HTTP com as credenciais do usuario
-            log_queue.put("Tentando login com CNPJ/senha informados (HTTP)...")
-            cookies_http = login_http(usuario, senha)
-            if cookies_http:
-                context.add_cookies(cookies_http)
-                if validar_sessao(page):
-                    log_queue.put("Login via HTTP funcionou!")
-                    autenticado = True
-
-            # Tentativa 2: login com anti-captcha (2captcha) se API key disponivel
-            if not autenticado and api_key:
-                log_queue.put("Tentando login com resolucao de reCAPTCHA via 2captcha...")
+            # ── Login com extensao 2captcha (Linux + API key) ──────
+            if usar_extensao:
+                log_queue.put("Fazendo login — extensao 2captcha resolve o captcha automaticamente...")
                 try:
-                    ok = login_com_anticaptcha(page, usuario, senha, api_key, log_queue)
-                    if ok and validar_sessao(page):
-                        log_queue.put("Login com anti-captcha funcionou!")
-                        autenticado = True
-                    else:
-                        log_queue.put("Login com anti-captcha falhou na validacao.")
-                except Exception as e:
-                    log_queue.put(f"  Erro no anti-captcha: {e}")
+                    from playwright_stealth import stealth_sync
+                    stealth_sync(page)
+                except Exception:
+                    pass
 
-            # Tentativa 3: login com stealth usando as credenciais do usuario
-            if not autenticado:
-                log_queue.put("Tentando login com stealth (simulando navegador humano)...")
-                ok = login_stealth(page, usuario, senha, log_queue)
-                if ok and validar_sessao(page):
-                    log_queue.put("Login com stealth funcionou!")
+                page.goto("https://portal.amhp.com.br/")
+                page.wait_for_load_state("networkidle")
+                page.wait_for_timeout(2000)
+
+                diagnosticar_pagina(page, log_queue, "  [pre-login] ")
+
+                page.locator("input[type='text']").last.fill(usuario)
+                page.locator("input[type='password']").fill(senha)
+                log_queue.put("  Clicando em ENTRAR — aguardando 2captcha (ate 2 min)...")
+                page.locator("button[type='button']").filter(has_text="ENTRAR").click()
+
+                try:
+                    page.wait_for_url("**/perfil.html", timeout=120000)
+                except Exception:
+                    page.wait_for_load_state("networkidle")
+
+                diagnosticar_pagina(page, log_queue, "  [pos-login] ")
+
+                if "perfil" in page.url and validar_sessao(page):
+                    log_queue.put("Login com extensao 2captcha funcionou!")
                     autenticado = True
                 else:
-                    log_queue.put("Login automatico bloqueado (provavel reCAPTCHA).")
+                    log_queue.put("Login com extensao falhou — tentando cookies...")
 
-            # Tentativa 3 (fallback): cookies colados no formulario para este CNPJ
+            # ── Fluxo legado: HTTP + stealth (Windows ou sem extensao) ──
+            if not autenticado and not usar_extensao:
+                log_queue.put("Tentando login via HTTP...")
+                cookies_http = login_http(usuario, senha)
+                if cookies_http:
+                    context.add_cookies(cookies_http)
+                    if validar_sessao(page):
+                        log_queue.put("Login via HTTP funcionou!")
+                        autenticado = True
+
+                if not autenticado:
+                    log_queue.put("Tentando login stealth...")
+                    ok = login_stealth(page, usuario, senha, log_queue)
+                    if ok and validar_sessao(page):
+                        log_queue.put("Login stealth funcionou!")
+                        autenticado = True
+
+            # ── Fallback: cookies colados ou salvos ────────────────
             if not autenticado:
                 cookies_limpo = (cookies_json or "").strip()
                 if not (cookies_limpo and cookies_limpo.startswith("[")):
-                    # Tenta cookies salvos especificos deste CNPJ
                     cookies_limpo = carregar_cookies_salvos(usuario) or ""
 
                 if cookies_limpo and cookies_limpo.startswith("["):
-                    log_queue.put("Login automatico falhou — usando cookies para este CNPJ...")
+                    log_queue.put("Usando cookies para autenticacao...")
                     login_com_cookies(context, cookies_limpo)
                     if validar_sessao(page):
                         salvar_cookies(usuario, cookies_limpo)
@@ -525,22 +615,19 @@ def rodar_exportacao(usuario, senha, quantidade, cookies_json, api_key, log_queu
                         if os.path.exists(cf):
                             os.remove(cf)
                         raise Exception(
-                            "Cookies invalidos ou expirados para este CNPJ.\n\n"
-                            "Para renovar:\n"
-                            "1. Faca login em portal.amhp.com.br\n"
-                            "2. Cookie-Editor > Export > Export as JSON\n"
-                            "3. Cole o JSON no campo 'Cookies' do app"
+                            "Cookies invalidos ou expirados.\n\n"
+                            "Renove: faca login em portal.amhp.com.br, exporte via Cookie-Editor e cole no campo 'Cookies'."
                         )
                 else:
                     raise Exception(
-                        "Login automatico bloqueado pelo reCAPTCHA do portal.\n\n"
-                        "Para continuar:\n"
-                        "1. Instale a extensao Cookie-Editor no navegador\n"
-                        "2. Faca login em portal.amhp.com.br com seu CNPJ\n"
-                        "3. Cookie-Editor > Export > Export as JSON\n"
-                        "4. Cole o JSON no campo 'Cookies' do app"
+                        "Nao foi possivel autenticar automaticamente.\n\n"
+                        "Cole os cookies no campo 'Cookies' do formulario:\n"
+                        "1. Faca login em portal.amhp.com.br\n"
+                        "2. Cookie-Editor > Export > Export as JSON\n"
+                        "3. Cole o JSON no app"
                     )
 
+            # ── Exportacao ─────────────────────────────────────────
             log_queue.put("Navegando para o Extrato...")
             page = navegar_para_extrato(page, log_queue)
             log_queue.put("Extrato carregado!")
@@ -563,7 +650,10 @@ def rodar_exportacao(usuario, senha, quantidade, cookies_json, api_key, log_queu
                 except Exception as e:
                     log_queue.put(f"  ERRO: {e}")
 
-            browser.close()
+            if browser:
+                browser.close()
+            else:
+                context.close()
 
         if arquivos_exportados:
             log_queue.put("Consolidando arquivos em Excel...")
@@ -575,6 +665,12 @@ def rodar_exportacao(usuario, senha, quantidade, cookies_json, api_key, log_queu
         import traceback
         log_queue.put(f"ERRO GERAL: {e}")
         log_queue.put(traceback.format_exc())
+    finally:
+        if xvfb_proc:
+            try:
+                xvfb_proc.terminate()
+            except Exception:
+                pass
 
     log_queue.put(("CONCLUIDO", arquivos_exportados))
 
