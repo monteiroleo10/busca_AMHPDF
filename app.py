@@ -8,6 +8,7 @@ import os
 import glob
 import platform
 import time
+import re
 import urllib.parse
 import base64
 import pandas as pd
@@ -63,7 +64,13 @@ def diagnosticar_pagina(page, log_queue, prefixo=""):
 # ─── DETECCAO DE SITEKEY ──────────────────────────────────────────
 
 def detectar_sitekey(page, log_queue):
-    page.wait_for_timeout(3000)
+    try:
+        page.wait_for_function(
+            "() => Array.from(document.scripts).some(s => s.src && s.src.includes('recaptcha'))",
+            timeout=3000,
+        )
+    except Exception:
+        pass
 
     resultado = page.evaluate("""() => {
         let sitekey = null, action = null, versao = 'v2';
@@ -140,7 +147,6 @@ def login_com_2captcha(page, usuario, senha, api_key, log_queue):
 
     page.goto("https://portal.amhp.com.br/")
     page.wait_for_load_state("networkidle")
-    page.wait_for_timeout(1000)
 
     for selector in ["input[name='username']", "input[name='user']", "input[type='text']"]:
         try:
@@ -197,13 +203,11 @@ def validar_sessao(page):
 # ─── NAVEGACAO E EXPORTACAO ───────────────────────────────────────
 
 def navegar_para_extrato(page, log_queue):
-    page.goto("https://portal.amhp.com.br/pages/PJ/perfil.html")
-    page.wait_for_load_state("networkidle")
-    page.wait_for_timeout(5000)
-
+    # Após login bem-sucedido já estamos em perfil.html — sem goto redundante
     try:
-        page.get_by_text("AMHPTISS", exact=False).first.click(timeout=10000)
-        page.wait_for_load_state("networkidle")
+        page.wait_for_selector("text=AMHPTISS", timeout=8000)
+        page.get_by_text("AMHPTISS", exact=False).first.click()
+        page.wait_for_load_state("load")
     except Exception:
         pass
 
@@ -315,7 +319,7 @@ def sessao_unica_thread(usuario, senha, api_key, log_queue, cmd_queue):
             log_queue.put("Autenticando...")
             ok = login_com_2captcha(page, usuario, senha, api_key, log_queue)
 
-            if not ok or not validar_sessao(page):
+            if not ok:
                 raise Exception("Login falhou. Verifique CPF/CNPJ, senha e saldo no 2captcha.")
 
             log_queue.put("Login realizado! Buscando referências disponíveis...")
@@ -473,14 +477,24 @@ if st.session_state.step == "input":
 
 # ── Etapa 2: aguardando referências ──────────────────────────────
 elif st.session_state.step == "buscando":
-    log_queue = st.session_state.log_queue
-    thread    = st.session_state.browser_thread
+    log_queue  = st.session_state.log_queue
+    thread     = st.session_state.browser_thread
+    ESTIMATIVA = 28  # segundos estimados para login + busca
 
-    st.info("Buscando referências disponíveis...")
-    log_placeholder = st.empty()
-    logs, refs, erro = [], None, None
+    st.markdown("**Buscando referências disponíveis...**")
+    progress_bar      = st.progress(0.0)
+    col_timer, col_est = st.columns([1, 3])
+    timer_ph          = col_timer.empty()
+    col_est.caption(f"Tempo estimado: ~{ESTIMATIVA}s")
+    status_ph         = st.empty()
+    logs, refs, erro  = [], None, None
+    start_time        = time.time()
 
     while refs is None and erro is None:
+        elapsed  = time.time() - start_time
+        progress_bar.progress(min(elapsed / ESTIMATIVA, 0.95))
+        timer_ph.metric("⏱", f"{int(elapsed)}s")
+
         while not log_queue.empty():
             item = log_queue.get_nowait()
             if isinstance(item, tuple) and item[0] == "REFERENCIAS":
@@ -489,12 +503,16 @@ elif st.session_state.step == "buscando":
                 erro = item[1]
             else:
                 logs.append(str(item))
-                log_placeholder.code("\n".join(logs))
+                status_ph.info(logs[-1])
+
         if refs is None and erro is None:
             if not thread.is_alive():
                 erro = "Sessão encerrada inesperadamente."
                 break
             time.sleep(0.2)
+
+    if refs is not None:
+        progress_bar.progress(1.0)
 
     if erro:
         st.session_state.cmd_queue.put(None)
@@ -535,14 +553,22 @@ elif st.session_state.step == "select":
 
 # ── Etapa 4: exportando ───────────────────────────────────────────
 elif st.session_state.step == "exportando":
-    log_queue = st.session_state.log_queue
-    thread    = st.session_state.browser_thread
+    log_queue  = st.session_state.log_queue
+    thread     = st.session_state.browser_thread
+    total_refs = len(st.session_state.selecionadas)
 
-    st.info(f"Exportando {len(st.session_state.selecionadas)} referência(s)...")
-    log_placeholder = st.empty()
+    st.markdown(f"**Exportando {total_refs} referência(s)...**")
+    progress_bar  = st.progress(0.0)
+    timer_ph      = st.empty()
+    log_ph        = st.empty()
     logs, arquivos_finais, erro = [], [], None
+    start_time    = time.time()
+    current_ref   = 0
 
     while thread.is_alive() or not log_queue.empty():
+        elapsed = time.time() - start_time
+        timer_ph.caption(f"⏱ {int(elapsed)}s")
+
         while not log_queue.empty():
             item = log_queue.get_nowait()
             if isinstance(item, tuple) and item[0] == "CONCLUIDO":
@@ -550,10 +576,16 @@ elif st.session_state.step == "exportando":
             elif isinstance(item, tuple) and item[0] == "ERRO":
                 erro = item[1]
             else:
-                logs.append(str(item))
-                log_placeholder.code("\n".join(logs))
+                msg = str(item)
+                m = re.search(r'\[(\d+)/\d+\]', msg)
+                if m:
+                    current_ref = int(m.group(1))
+                    progress_bar.progress((current_ref - 0.5) / total_refs)
+                logs.append(msg)
+                log_ph.code("\n".join(logs))
         time.sleep(0.2)
 
+    progress_bar.progress(1.0)
     st.session_state.arquivos_finais = arquivos_finais
     if erro:
         st.session_state.erro = erro
