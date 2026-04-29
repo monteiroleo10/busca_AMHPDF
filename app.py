@@ -94,7 +94,21 @@ def validar_sessao(page):
     return True
 
 
-def login_stealth(page, usuario, senha):
+def diagnosticar_pagina(page, log_queue, prefixo=""):
+    """Loga URL, titulo, texto visivel e salva screenshot para diagnostico."""
+    try:
+        log_queue.put(f"{prefixo}URL: {page.url}")
+        log_queue.put(f"{prefixo}Titulo: {page.title()}")
+        texto = page.evaluate("() => document.body ? document.body.innerText.slice(0, 600) : ''")
+        log_queue.put(f"{prefixo}Texto: {texto}")
+        screenshot_path = "/tmp/amhp_debug.png"
+        page.screenshot(path=screenshot_path, full_page=False)
+        log_queue.put(f"{prefixo}Screenshot salvo em {screenshot_path}")
+    except Exception as e:
+        log_queue.put(f"{prefixo}Erro no diagnostico: {e}")
+
+
+def login_stealth(page, usuario, senha, log_queue=None):
     """Tenta login com Playwright disfarçado de navegador humano."""
     try:
         from playwright_stealth import stealth_sync
@@ -105,13 +119,27 @@ def login_stealth(page, usuario, senha):
     page.goto("https://portal.amhp.com.br/")
     page.wait_for_load_state("networkidle")
     page.wait_for_timeout(2000)
-    page.locator("input[type='text']").last.fill(usuario)
-    page.locator("input[type='password']").fill(senha)
-    page.locator("button[type='button']").filter(has_text="ENTRAR").click()
+
+    if log_queue:
+        diagnosticar_pagina(page, log_queue, "  [pre-login] ")
+
+    try:
+        page.locator("input[type='text']").last.fill(usuario)
+        page.locator("input[type='password']").fill(senha)
+        page.locator("button[type='button']").filter(has_text="ENTRAR").click()
+    except Exception as e:
+        if log_queue:
+            log_queue.put(f"  Erro ao preencher formulario: {e}")
+        return False
+
     try:
         page.wait_for_url("**/perfil.html", timeout=15000)
     except Exception:
         page.wait_for_load_state("networkidle")
+
+    if log_queue:
+        diagnosticar_pagina(page, log_queue, "  [pos-login] ")
+
     return "perfil" in page.url
 
 
@@ -471,7 +499,7 @@ def rodar_exportacao(usuario, senha, quantidade, cookies_json, api_key, log_queu
             # Tentativa 3: login com stealth usando as credenciais do usuario
             if not autenticado:
                 log_queue.put("Tentando login com stealth (simulando navegador humano)...")
-                ok = login_stealth(page, usuario, senha)
+                ok = login_stealth(page, usuario, senha, log_queue)
                 if ok and validar_sessao(page):
                     log_queue.put("Login com stealth funcionou!")
                     autenticado = True
@@ -647,3 +675,8 @@ if iniciar:
                     )
         else:
             st.error("Nenhum arquivo foi exportado. Verifique o log acima.")
+            screenshot_path = "/tmp/amhp_debug.png"
+            if os.path.exists(screenshot_path):
+                st.subheader("Screenshot da pagina no momento da falha")
+                with open(screenshot_path, "rb") as f:
+                    st.image(f.read(), caption="Estado da pagina ao falhar o login")
