@@ -315,27 +315,54 @@ def consolidar_excel(arquivos, usuario):
 
 # ─── FLUXO PRINCIPAL ──────────────────────────────────────────────
 
-def rodar_exportacao(usuario, senha, quantidade, api_key, log_queue):
+def _criar_browser(p):
+    if platform.system() == "Windows":
+        return p.chromium.launch(headless=HEADLESS, executable_path=encontrar_chromium())
+    return p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+
+
+def _criar_context(browser):
+    return browser.new_context(
+        accept_downloads=True,
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    )
+
+
+def buscar_referencias_thread(usuario, senha, api_key, log_queue):
+    try:
+        log_queue.put("Iniciando navegador...")
+        with sync_playwright() as p:
+            browser = _criar_browser(p)
+            page = _criar_context(browser).new_page()
+
+            log_queue.put("Autenticando via 2captcha...")
+            ok = login_com_2captcha(page, usuario, senha, api_key, log_queue)
+
+            if not ok or not validar_sessao(page):
+                raise Exception("Login falhou. Verifique CNPJ, senha e saldo no 2captcha.")
+
+            log_queue.put("Login realizado! Buscando referencias...")
+            page = navegar_para_extrato(page, log_queue)
+            refs = obter_referencias_disponiveis(page)
+            log_queue.put(f"Encontradas {len(refs)} referencias.")
+            browser.close()
+
+        log_queue.put(("REFERENCIAS", refs))
+
+    except Exception as e:
+        import traceback
+        log_queue.put(f"ERRO: {e}")
+        log_queue.put(traceback.format_exc())
+        log_queue.put(("ERRO", str(e)))
+
+
+def rodar_exportacao(usuario, senha, referencias_selecionadas, api_key, log_queue):
     arquivos_exportados = []
     try:
         log_queue.put("Iniciando navegador...")
         with sync_playwright() as p:
-            if platform.system() == "Windows":
-                browser = p.chromium.launch(
-                    headless=HEADLESS,
-                    executable_path=encontrar_chromium(),
-                )
-            else:
-                browser = p.chromium.launch(
-                    headless=True,
-                    args=["--no-sandbox", "--disable-dev-shm-usage"],
-                )
-
-            context = browser.new_context(
-                accept_downloads=True,
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            )
-            page = context.new_page()
+            browser = _criar_browser(p)
+            page = _criar_context(browser).new_page()
 
             log_queue.put("Autenticando via 2captcha...")
             ok = login_com_2captcha(page, usuario, senha, api_key, log_queue)
@@ -345,16 +372,10 @@ def rodar_exportacao(usuario, senha, quantidade, api_key, log_queue):
 
             log_queue.put("Login realizado! Navegando para o Extrato...")
             page = navegar_para_extrato(page, log_queue)
-            log_queue.put("Extrato carregado!")
+            log_queue.put(f"Exportando {len(referencias_selecionadas)} referencia(s)...")
 
-            todas = obter_referencias_disponiveis(page)
-            referencias = todas[:quantidade]
-            log_queue.put(f"Referencias ({quantidade} mais recentes):")
-            for i, ref in enumerate(referencias):
-                log_queue.put(f"  [{i+1}] {ref}")
-
-            for i, ref in enumerate(referencias):
-                log_queue.put(f"Exportando [{i+1}/{len(referencias)}]: {ref}")
+            for i, ref in enumerate(referencias_selecionadas):
+                log_queue.put(f"Exportando [{i+1}/{len(referencias_selecionadas)}]: {ref}")
                 try:
                     caminho = exportar_csv(page, ref, usuario)
                     if caminho:
@@ -418,8 +439,7 @@ st.markdown("""
         background-color: #4A90C4 !important;
     }
 
-    .stTextInput > div > div > input,
-    .stNumberInput input {
+    .stTextInput > div > div > input {
         border-radius: 6px !important;
         border: 1.5px solid #c5d8ea !important;
     }
@@ -457,69 +477,159 @@ if not api_key:
     st.error("Chave 2captcha nao configurada. Defina a variavel de ambiente ANTICAPTCHA_KEY.")
     st.stop()
 
-with st.form("login_form"):
-    usuario = st.text_input("CPF/CNPJ")
-    senha   = st.text_input("Senha", type="password")
-    qtd     = st.number_input("Quantos extratos recentes?", min_value=1, max_value=50, value=1, step=1)
-    iniciar = st.form_submit_button("Exportar", use_container_width=True)
+# Inicializa session_state
+for _k, _v in [("step", "input"), ("referencias", []), ("usuario", ""), ("senha", ""),
+               ("selecionadas", []), ("arquivos_finais", [])]:
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
 
-if iniciar:
-    if not usuario or not senha:
-        st.error("Preencha CPF/CNPJ e Senha.")
-    else:
-        log_queue = queue.Queue()
-        thread = threading.Thread(
-            target=rodar_exportacao,
-            args=(usuario, senha, int(qtd), api_key, log_queue),
-            daemon=True,
-        )
-        thread.start()
+# ── Etapa 1: credenciais ──────────────────────────────────────────
+if st.session_state.step == "input":
+    if st.session_state.get("erro"):
+        st.error(st.session_state.pop("erro"))
 
-        st.subheader("Progresso")
-        log_placeholder = st.empty()
-        logs = []
-        arquivos_finais = []
+    with st.form("credentials_form"):
+        usuario = st.text_input("CPF/CNPJ")
+        senha   = st.text_input("Senha", type="password")
+        buscar  = st.form_submit_button("Buscar Referências", use_container_width=True)
 
-        while thread.is_alive() or not log_queue.empty():
-            while not log_queue.empty():
-                item = log_queue.get_nowait()
-                if isinstance(item, tuple) and item[0] == "CONCLUIDO":
-                    arquivos_finais = item[1]
-                else:
-                    logs.append(item)
-                    log_placeholder.code("\n".join(logs))
-            time.sleep(0.2)
-
-        csvs  = [f for f in arquivos_finais if f.endswith(".csv")]
-        excel = next((f for f in arquivos_finais if f.endswith(".xlsx")), None)
-
-        if arquivos_finais:
-            st.success(f"Concluido! {len(csvs)} CSV(s) exportado(s).")
-            st.subheader("Baixar arquivos")
-            for arq in csvs:
-                with open(arq, "rb") as f:
-                    st.download_button(
-                        label=f"Baixar {os.path.basename(arq)}",
-                        data=f.read(),
-                        file_name=os.path.basename(arq),
-                        mime="text/csv",
-                    )
-            if excel and os.path.exists(excel):
-                with open(excel, "rb") as f:
-                    st.download_button(
-                        label=f"Baixar {os.path.basename(excel)} (consolidado)",
-                        data=f.read(),
-                        file_name=os.path.basename(excel),
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
+    if buscar:
+        if not usuario or not senha:
+            st.error("Preencha CPF/CNPJ e Senha.")
         else:
-            st.error("Nenhum arquivo exportado. Verifique o log acima.")
-            if os.path.exists("/tmp/amhp_debug.png"):
-                st.subheader("Screenshot no momento da falha")
-                with open("/tmp/amhp_debug.png", "rb") as f:
-                    st.image(f.read(), caption="Estado da pagina ao falhar o login")
+            st.session_state.usuario = usuario
+            st.session_state.senha   = senha
+            st.session_state.step    = "buscando"
+            st.rerun()
 
-# Rodapé com logo do desenvolvedor
+# ── Etapa 2: buscando referências (bloqueante) ────────────────────
+elif st.session_state.step == "buscando":
+    log_queue = queue.Queue()
+    thread = threading.Thread(
+        target=buscar_referencias_thread,
+        args=(st.session_state.usuario, st.session_state.senha, api_key, log_queue),
+        daemon=True,
+    )
+    thread.start()
+
+    st.info("Buscando referências disponíveis...")
+    log_placeholder = st.empty()
+    logs, refs, erro = [], [], None
+
+    while thread.is_alive() or not log_queue.empty():
+        while not log_queue.empty():
+            item = log_queue.get_nowait()
+            if isinstance(item, tuple) and item[0] == "REFERENCIAS":
+                refs = item[1]
+            elif isinstance(item, tuple) and item[0] == "ERRO":
+                erro = item[1]
+            else:
+                logs.append(str(item))
+                log_placeholder.code("\n".join(logs))
+        time.sleep(0.2)
+
+    if erro:
+        st.session_state.erro = erro
+        st.session_state.step = "input"
+    else:
+        st.session_state.referencias = refs
+        st.session_state.step = "select"
+    st.rerun()
+
+# ── Etapa 3: seleção de referências ──────────────────────────────
+elif st.session_state.step == "select":
+    st.markdown(f"**{len(st.session_state.referencias)} referência(s) disponível(is)**")
+
+    selecionadas = st.multiselect(
+        "Selecione as referências para exportar:",
+        options=st.session_state.referencias,
+        default=st.session_state.referencias[:1] if st.session_state.referencias else [],
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("← Voltar", use_container_width=True):
+            st.session_state.step = "input"
+            st.rerun()
+    with col2:
+        exportar = st.button("Exportar Selecionados →", use_container_width=True)
+
+    if exportar:
+        if not selecionadas:
+            st.error("Selecione ao menos uma referência.")
+        else:
+            st.session_state.selecionadas = selecionadas
+            st.session_state.step = "exportando"
+            st.rerun()
+
+# ── Etapa 4: exportando (bloqueante) ─────────────────────────────
+elif st.session_state.step == "exportando":
+    log_queue = queue.Queue()
+    thread = threading.Thread(
+        target=rodar_exportacao,
+        args=(st.session_state.usuario, st.session_state.senha,
+              st.session_state.selecionadas, api_key, log_queue),
+        daemon=True,
+    )
+    thread.start()
+
+    st.subheader("Exportando...")
+    log_placeholder = st.empty()
+    logs, arquivos_finais = [], []
+
+    while thread.is_alive() or not log_queue.empty():
+        while not log_queue.empty():
+            item = log_queue.get_nowait()
+            if isinstance(item, tuple) and item[0] == "CONCLUIDO":
+                arquivos_finais = item[1]
+            else:
+                logs.append(str(item))
+                log_placeholder.code("\n".join(logs))
+        time.sleep(0.2)
+
+    st.session_state.arquivos_finais = arquivos_finais
+    st.session_state.step = "done"
+    st.rerun()
+
+# ── Etapa 5: download ─────────────────────────────────────────────
+elif st.session_state.step == "done":
+    arquivos_finais = st.session_state.arquivos_finais
+    csvs  = [f for f in arquivos_finais if f.endswith(".csv")]
+    excel = next((f for f in arquivos_finais if f.endswith(".xlsx")), None)
+
+    if arquivos_finais:
+        st.success(f"Concluido! {len(csvs)} CSV(s) exportado(s).")
+        st.subheader("Baixar arquivos")
+        for arq in csvs:
+            with open(arq, "rb") as f:
+                st.download_button(
+                    label=f"Baixar {os.path.basename(arq)}",
+                    data=f.read(),
+                    file_name=os.path.basename(arq),
+                    mime="text/csv",
+                )
+        if excel and os.path.exists(excel):
+            with open(excel, "rb") as f:
+                st.download_button(
+                    label=f"Baixar {os.path.basename(excel)} (consolidado)",
+                    data=f.read(),
+                    file_name=os.path.basename(excel),
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+    else:
+        st.error("Nenhum arquivo exportado.")
+        if os.path.exists("/tmp/amhp_debug.png"):
+            st.subheader("Screenshot no momento da falha")
+            with open("/tmp/amhp_debug.png", "rb") as f:
+                st.image(f.read(), caption="Estado da pagina ao falhar o login")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    if st.button("Nova Exportação", use_container_width=True):
+        for _k in ["step", "referencias", "usuario", "senha", "selecionadas", "arquivos_finais"]:
+            st.session_state.pop(_k, None)
+        st.rerun()
+
+# ── Rodapé ────────────────────────────────────────────────────────
 if os.path.exists("logo_b4strategy.png"):
     with open("logo_b4strategy.png", "rb") as f:
         logo_b64 = base64.b64encode(f.read()).decode()
