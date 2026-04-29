@@ -203,20 +203,30 @@ def login_com_2captcha(page, usuario, senha, api_key, log_queue):
 
     page.goto("https://portal.amhp.com.br/")
     page.wait_for_load_state("networkidle")
+    page.wait_for_timeout(1000)
 
     diagnosticar_pagina(page, log_queue, "  [pre-login] ")
+
+    # Preenche credenciais ANTES de resolver o captcha
+    # (o callback do recaptcha pode submeter o form automaticamente)
+    page.locator("input[type='text']").last.fill(usuario)
+    page.locator("input[type='password']").fill(senha)
+    log_queue.put(f"  Credenciais preenchidas.")
 
     sitekey = detectar_sitekey(page, log_queue)
     if sitekey:
         token = resolver_captcha_2captcha(sitekey, page.url, api_key, log_queue)
         injetar_token(page, token)
-        page.wait_for_timeout(1000)
+        # Aguarda navegacao automatica (alguns sites submetem ao receber o token)
+        try:
+            page.wait_for_url("**/perfil.html", timeout=5000)
+            log_queue.put("  Form submetido automaticamente pelo captcha.")
+        except Exception:
+            # Nao navegou sozinho — clica ENTRAR manualmente
+            page.locator("button[type='button']").filter(has_text="ENTRAR").click()
     else:
-        log_queue.put("  Nenhum captcha detectado — tentando login direto.")
-
-    page.locator("input[type='text']").last.fill(usuario)
-    page.locator("input[type='password']").fill(senha)
-    page.locator("button[type='button']").filter(has_text="ENTRAR").click()
+        log_queue.put("  Nenhum captcha detectado — submetendo direto.")
+        page.locator("button[type='button']").filter(has_text="ENTRAR").click()
 
     try:
         page.wait_for_url("**/perfil.html", timeout=20000)
