@@ -111,11 +111,6 @@ def detectar_sitekey(page, log_queue):
     action  = resultado.get("action")
     versao  = resultado.get("versao", "v2")
 
-    if sitekey:
-        log_queue.put(f"  Sitekey ({versao}): {sitekey[:20]}... action={action}")
-    else:
-        log_queue.put("  Sitekey nao encontrado.")
-
     return sitekey, versao, action
 
 
@@ -124,7 +119,6 @@ def detectar_sitekey(page, log_queue):
 def resolver_captcha(sitekey, page_url, api_key, log_queue, versao="v2", action=None):
     from twocaptcha import TwoCaptcha
     solver = TwoCaptcha(api_key)
-    log_queue.put(f"  Enviando para 2captcha ({versao}, action={action})...")
     if versao == "v3":
         result = solver.recaptcha(
             sitekey=sitekey, url=page_url,
@@ -132,7 +126,6 @@ def resolver_captcha(sitekey, page_url, api_key, log_queue, versao="v2", action=
         )
     else:
         result = solver.recaptcha(sitekey=sitekey, url=page_url)
-    log_queue.put("  Captcha resolvido!")
     return result["code"]
 
 
@@ -149,15 +142,11 @@ def login_com_2captcha(page, usuario, senha, api_key, log_queue):
     page.wait_for_load_state("networkidle")
     page.wait_for_timeout(1000)
 
-    diagnosticar_pagina(page, log_queue, "  [pre-login] ")
-
-    # Preenche credenciais antes de resolver o captcha
     for selector in ["input[name='username']", "input[name='user']", "input[type='text']"]:
         try:
             loc = page.locator(selector).last
             if loc.count() > 0:
                 loc.fill(usuario)
-                log_queue.put(f"  Usuario preenchido via: {selector}")
                 break
         except Exception:
             continue
@@ -170,7 +159,6 @@ def login_com_2captcha(page, usuario, senha, api_key, log_queue):
 
     token = resolver_captcha(sitekey, page.url, api_key, log_queue, versao=versao, action=action)
 
-    # Intercepta o POST e injeta o token resolvido antes de chegar no servidor
     interceptado = [False]
 
     def trocar_token(route, request):
@@ -179,14 +167,12 @@ def login_com_2captcha(page, usuario, senha, api_key, log_queue):
             if "g-recaptcha-response" in pd:
                 try:
                     params = dict(urllib.parse.parse_qsl(pd, keep_blank_values=True))
-                    old = params.get("g-recaptcha-response", "")[:20]
                     params["g-recaptcha-response"] = token
-                    log_queue.put(f"  POST interceptado! {old}... -> token 2captcha")
                     interceptado[0] = True
                     route.continue_(post_data=urllib.parse.urlencode(params))
                     return
-                except Exception as e:
-                    log_queue.put(f"  Erro na interceptacao: {e}")
+                except Exception:
+                    pass
         route.continue_()
 
     page.route("**/*", trocar_token)
@@ -199,10 +185,6 @@ def login_com_2captcha(page, usuario, senha, api_key, log_queue):
     finally:
         page.unroute("**/*", trocar_token)
 
-    if not interceptado[0]:
-        log_queue.put("  AVISO: POST nao interceptado — pode usar fetch/XHR.")
-
-    diagnosticar_pagina(page, log_queue, "  [pos-login] ")
     return "perfil" in page.url
 
 
@@ -219,19 +201,14 @@ def navegar_para_extrato(page, log_queue):
     page.wait_for_load_state("networkidle")
     page.wait_for_timeout(5000)
 
-    iframes = page.evaluate("() => Array.from(document.querySelectorAll('iframe')).map(f => f.src || f.name || 'sem-src')")
-    log_queue.put(f"  Iframes: {iframes}")
-
     try:
         page.get_by_text("AMHPTISS", exact=False).first.click(timeout=10000)
         page.wait_for_load_state("networkidle")
-        log_queue.put(f"  URL apos clique: {page.url}")
-    except Exception as e:
-        log_queue.put(f"  Clique AMHPTISS falhou: {e}")
+    except Exception:
+        pass
 
     page.goto("https://amhptiss.amhp.com.br/Extrato.aspx")
     page.wait_for_load_state("networkidle")
-    log_queue.put(f"  Extrato URL: {page.url}")
     return page
 
 
@@ -328,77 +305,59 @@ def _criar_context(browser):
     )
 
 
-def buscar_referencias_thread(usuario, senha, api_key, log_queue):
+def sessao_unica_thread(usuario, senha, api_key, log_queue, cmd_queue):
     try:
-        log_queue.put("Iniciando navegador...")
+        log_queue.put("Iniciando sessão...")
         with sync_playwright() as p:
             browser = _criar_browser(p)
             page = _criar_context(browser).new_page()
 
-            log_queue.put("Autenticando via 2captcha...")
+            log_queue.put("Autenticando...")
             ok = login_com_2captcha(page, usuario, senha, api_key, log_queue)
 
             if not ok or not validar_sessao(page):
-                raise Exception("Login falhou. Verifique CNPJ, senha e saldo no 2captcha.")
+                raise Exception("Login falhou. Verifique CPF/CNPJ, senha e saldo no 2captcha.")
 
-            log_queue.put("Login realizado! Buscando referencias...")
+            log_queue.put("Login realizado! Buscando referências disponíveis...")
             page = navegar_para_extrato(page, log_queue)
             refs = obter_referencias_disponiveis(page)
-            log_queue.put(f"Encontradas {len(refs)} referencias.")
-            browser.close()
+            log_queue.put(f"{len(refs)} referência(s) encontrada(s).")
+            log_queue.put(("REFERENCIAS", refs))
 
-        log_queue.put(("REFERENCIAS", refs))
+            # Pausa aqui aguardando a seleção do usuário
+            selecionadas = cmd_queue.get()
 
-    except Exception as e:
-        import traceback
-        log_queue.put(f"ERRO: {e}")
-        log_queue.put(traceback.format_exc())
-        log_queue.put(("ERRO", str(e)))
+            if selecionadas is None:
+                browser.close()
+                return
 
-
-def rodar_exportacao(usuario, senha, referencias_selecionadas, api_key, log_queue):
-    arquivos_exportados = []
-    try:
-        log_queue.put("Iniciando navegador...")
-        with sync_playwright() as p:
-            browser = _criar_browser(p)
-            page = _criar_context(browser).new_page()
-
-            log_queue.put("Autenticando via 2captcha...")
-            ok = login_com_2captcha(page, usuario, senha, api_key, log_queue)
-
-            if not ok or not validar_sessao(page):
-                raise Exception("Login falhou. Verifique CNPJ, senha e saldo no 2captcha.")
-
-            log_queue.put("Login realizado! Navegando para o Extrato...")
-            page = navegar_para_extrato(page, log_queue)
-            log_queue.put(f"Exportando {len(referencias_selecionadas)} referencia(s)...")
-
-            for i, ref in enumerate(referencias_selecionadas):
-                log_queue.put(f"Exportando [{i+1}/{len(referencias_selecionadas)}]: {ref}")
+            arquivos = []
+            log_queue.put(f"Exportando {len(selecionadas)} referência(s)...")
+            for i, ref in enumerate(selecionadas):
+                log_queue.put(f"  [{i+1}/{len(selecionadas)}] {ref}")
                 try:
                     caminho = exportar_csv(page, ref, usuario)
                     if caminho:
-                        arquivos_exportados.append(caminho)
+                        arquivos.append(caminho)
                         log_queue.put(f"  Salvo: {os.path.basename(caminho)}")
                     time.sleep(2)
                 except Exception as e:
-                    log_queue.put(f"  ERRO: {e}")
+                    log_queue.put(f"  Erro em {ref}: {e}")
 
             browser.close()
 
-        if arquivos_exportados:
+        if arquivos:
             log_queue.put("Consolidando em Excel...")
-            excel = consolidar_excel(arquivos_exportados, usuario)
-            arquivos_exportados.append(excel)
-            log_queue.put(f"Excel: {os.path.basename(excel)}")
+            excel = consolidar_excel(arquivos, usuario)
+            arquivos.append(excel)
+
+        log_queue.put(("CONCLUIDO", arquivos))
 
     except Exception as e:
         import traceback
-        log_queue.put(f"ERRO GERAL: {e}")
+        log_queue.put(f"Erro: {e}")
         log_queue.put(traceback.format_exc())
-
-    log_queue.put(("CONCLUIDO", arquivos_exportados))
+        log_queue.put(("ERRO", str(e)))
 
 
 # ─── INTERFACE STREAMLIT ──────────────────────────────────────────
@@ -497,26 +456,31 @@ if st.session_state.step == "input":
         if not usuario or not senha:
             st.error("Preencha CPF/CNPJ e Senha.")
         else:
-            st.session_state.usuario = usuario
-            st.session_state.senha   = senha
-            st.session_state.step    = "buscando"
+            st.session_state.usuario   = usuario
+            st.session_state.senha     = senha
+            st.session_state.log_queue = queue.Queue()
+            st.session_state.cmd_queue = queue.Queue()
+            t = threading.Thread(
+                target=sessao_unica_thread,
+                args=(usuario, senha, api_key,
+                      st.session_state.log_queue, st.session_state.cmd_queue),
+                daemon=True,
+            )
+            t.start()
+            st.session_state.browser_thread = t
+            st.session_state.step = "buscando"
             st.rerun()
 
-# ── Etapa 2: buscando referências (bloqueante) ────────────────────
+# ── Etapa 2: aguardando referências ──────────────────────────────
 elif st.session_state.step == "buscando":
-    log_queue = queue.Queue()
-    thread = threading.Thread(
-        target=buscar_referencias_thread,
-        args=(st.session_state.usuario, st.session_state.senha, api_key, log_queue),
-        daemon=True,
-    )
-    thread.start()
+    log_queue = st.session_state.log_queue
+    thread    = st.session_state.browser_thread
 
     st.info("Buscando referências disponíveis...")
     log_placeholder = st.empty()
-    logs, refs, erro = [], [], None
+    logs, refs, erro = [], None, None
 
-    while thread.is_alive() or not log_queue.empty():
+    while refs is None and erro is None:
         while not log_queue.empty():
             item = log_queue.get_nowait()
             if isinstance(item, tuple) and item[0] == "REFERENCIAS":
@@ -526,9 +490,14 @@ elif st.session_state.step == "buscando":
             else:
                 logs.append(str(item))
                 log_placeholder.code("\n".join(logs))
-        time.sleep(0.2)
+        if refs is None and erro is None:
+            if not thread.is_alive():
+                erro = "Sessão encerrada inesperadamente."
+                break
+            time.sleep(0.2)
 
     if erro:
+        st.session_state.cmd_queue.put(None)
         st.session_state.erro = erro
         st.session_state.step = "input"
     else:
@@ -549,6 +518,7 @@ elif st.session_state.step == "select":
     col1, col2 = st.columns(2)
     with col1:
         if st.button("← Voltar", use_container_width=True):
+            st.session_state.cmd_queue.put(None)
             st.session_state.step = "input"
             st.rerun()
     with col2:
@@ -559,46 +529,48 @@ elif st.session_state.step == "select":
             st.error("Selecione ao menos uma referência.")
         else:
             st.session_state.selecionadas = selecionadas
+            st.session_state.cmd_queue.put(selecionadas)
             st.session_state.step = "exportando"
             st.rerun()
 
-# ── Etapa 4: exportando (bloqueante) ─────────────────────────────
+# ── Etapa 4: exportando ───────────────────────────────────────────
 elif st.session_state.step == "exportando":
-    log_queue = queue.Queue()
-    thread = threading.Thread(
-        target=rodar_exportacao,
-        args=(st.session_state.usuario, st.session_state.senha,
-              st.session_state.selecionadas, api_key, log_queue),
-        daemon=True,
-    )
-    thread.start()
+    log_queue = st.session_state.log_queue
+    thread    = st.session_state.browser_thread
 
-    st.subheader("Exportando...")
+    st.info(f"Exportando {len(st.session_state.selecionadas)} referência(s)...")
     log_placeholder = st.empty()
-    logs, arquivos_finais = [], []
+    logs, arquivos_finais, erro = [], [], None
 
     while thread.is_alive() or not log_queue.empty():
         while not log_queue.empty():
             item = log_queue.get_nowait()
             if isinstance(item, tuple) and item[0] == "CONCLUIDO":
                 arquivos_finais = item[1]
+            elif isinstance(item, tuple) and item[0] == "ERRO":
+                erro = item[1]
             else:
                 logs.append(str(item))
                 log_placeholder.code("\n".join(logs))
         time.sleep(0.2)
 
     st.session_state.arquivos_finais = arquivos_finais
+    if erro:
+        st.session_state.erro = erro
     st.session_state.step = "done"
     st.rerun()
 
 # ── Etapa 5: download ─────────────────────────────────────────────
 elif st.session_state.step == "done":
+    if st.session_state.get("erro"):
+        st.error(st.session_state.pop("erro"))
+
     arquivos_finais = st.session_state.arquivos_finais
     csvs  = [f for f in arquivos_finais if f.endswith(".csv")]
     excel = next((f for f in arquivos_finais if f.endswith(".xlsx")), None)
 
     if arquivos_finais:
-        st.success(f"Concluido! {len(csvs)} CSV(s) exportado(s).")
+        st.success(f"Concluído! {len(csvs)} arquivo(s) exportado(s).")
         st.subheader("Baixar arquivos")
         for arq in csvs:
             with open(arq, "rb") as f:
@@ -617,15 +589,15 @@ elif st.session_state.step == "done":
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 )
     else:
-        st.error("Nenhum arquivo exportado.")
+        st.warning("Nenhum arquivo exportado. Verifique suas credenciais e tente novamente.")
         if os.path.exists("/tmp/amhp_debug.png"):
-            st.subheader("Screenshot no momento da falha")
             with open("/tmp/amhp_debug.png", "rb") as f:
-                st.image(f.read(), caption="Estado da pagina ao falhar o login")
+                st.image(f.read(), caption="Estado da página ao falhar")
 
     st.markdown("<br>", unsafe_allow_html=True)
     if st.button("Nova Exportação", use_container_width=True):
-        for _k in ["step", "referencias", "usuario", "senha", "selecionadas", "arquivos_finais"]:
+        for _k in ["step", "referencias", "usuario", "senha", "selecionadas",
+                   "arquivos_finais", "log_queue", "cmd_queue", "browser_thread"]:
             st.session_state.pop(_k, None)
         st.rerun()
 
