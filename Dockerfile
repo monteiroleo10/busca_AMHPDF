@@ -1,15 +1,13 @@
 FROM python:3.11-slim-bookworm
 
-RUN apt-get update && apt-get install -y \
-    wget \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-RUN playwright install firefox
-RUN playwright install-deps firefox
+RUN playwright install chromium
+RUN playwright install-deps chromium
 
 COPY . .
 
