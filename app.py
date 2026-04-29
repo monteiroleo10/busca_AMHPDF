@@ -70,8 +70,11 @@ def diagnosticar_pagina(page, log_queue, prefixo=""):
     try:
         log_queue.put(f"{prefixo}URL: {page.url}")
         log_queue.put(f"{prefixo}Titulo: {page.title()}")
-        texto = page.evaluate("() => document.body ? document.body.innerText.slice(0, 500) : ''")
+        texto = page.evaluate("() => document.body ? document.body.innerText.slice(0, 800) : ''")
         log_queue.put(f"{prefixo}Texto: {texto}")
+        inputs = page.evaluate("""() => Array.from(document.querySelectorAll('input')).map(i =>
+            ({type: i.type, name: i.name, id: i.id, value: i.value.slice(0,10) || '(vazio)'}))""")
+        log_queue.put(f"{prefixo}Inputs: {inputs}")
         page.screenshot(path="/tmp/amhp_debug.png", full_page=False)
     except Exception as e:
         log_queue.put(f"{prefixo}Erro no diagnostico: {e}")
@@ -98,7 +101,7 @@ def detectar_sitekey(page, log_queue):
             const t = s.text || '';
             const m = t.match(/['"](6L[0-9A-Za-z_-]{30,})['"]/)
                    || t.match(/sitekey["' :]+([0-9A-Za-z_-]{30,})/)
-                   || t.match(/grecaptcha[^(]*\([^)]*["']([0-9A-Za-z_-]{30,})["']/);
+                   || t.match(/grecaptcha[^(]*\\([^)]*["']([0-9A-Za-z_-]{30,})["']/);
             if (m) return m[1];
         }
 
@@ -208,10 +211,22 @@ def login_com_2captcha(page, usuario, senha, api_key, log_queue):
     diagnosticar_pagina(page, log_queue, "  [pre-login] ")
 
     # Preenche credenciais ANTES de resolver o captcha
-    # (o callback do recaptcha pode submeter o form automaticamente)
-    page.locator("input[type='text']").last.fill(usuario)
+    usuario_filled = False
+    for selector in ["input[name='username']", "input[name='user']", "input[type='text']"]:
+        try:
+            loc = page.locator(selector).last
+            if loc.count() > 0:
+                loc.fill(usuario)
+                usuario_filled = True
+                log_queue.put(f"  Usuario preenchido via: {selector}")
+                break
+        except Exception:
+            continue
+    if not usuario_filled:
+        log_queue.put("  AVISO: nao encontrou campo de usuario!")
+
     page.locator("input[type='password']").fill(senha)
-    log_queue.put(f"  Credenciais preenchidas.")
+    log_queue.put("  Senha preenchida.")
 
     sitekey = detectar_sitekey(page, log_queue)
     if sitekey:
