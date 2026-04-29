@@ -85,55 +85,88 @@ def diagnosticar_pagina(page, log_queue, prefixo=""):
 def detectar_sitekey(page, log_queue):
     page.wait_for_timeout(3000)
 
-    sitekey = page.evaluate("""() => {
-        // 1. data-sitekey em qualquer elemento
+    resultado = page.evaluate("""() => {
+        let sitekey = null;
+        let action = null;
+        let versao = 'v2';
+
+        // action de campo oculto (indica v3)
+        const actionEl = document.querySelector('input[name="action"]');
+        if (actionEl) action = actionEl.value;
+
+        // 1. data-sitekey (v2 widget)
         const el = document.querySelector('[data-sitekey]');
-        if (el) return el.getAttribute('data-sitekey');
+        if (el) sitekey = el.getAttribute('data-sitekey');
 
-        // 2. iframe do reCAPTCHA
-        for (const f of document.querySelectorAll('iframe')) {
-            const m = f.src.match(/[?&]k=([^&]+)/);
-            if (m) return m[1];
-        }
-
-        // 3. scripts inline
-        for (const s of document.scripts) {
-            const t = s.text || '';
-            const m = t.match(/['"](6L[0-9A-Za-z_-]{30,})['"]/)
-                   || t.match(/sitekey["' :]+([0-9A-Za-z_-]{30,})/)
-                   || t.match(/grecaptcha[^(]*\\([^)]*["']([0-9A-Za-z_-]{30,})["']/);
-            if (m) return m[1];
-        }
-
-        // 4. src de scripts externos (recaptcha v3)
-        for (const s of document.scripts) {
-            if (s.src) {
-                const m = s.src.match(/[?&]render=([^&]+)/);
-                if (m && m[1] !== 'explicit') return m[1];
+        // 2. iframe do reCAPTCHA (v2)
+        if (!sitekey) {
+            for (const f of document.querySelectorAll('iframe')) {
+                const m = f.src.match(/[?&]k=([^&]+)/);
+                if (m) { sitekey = m[1]; break; }
             }
         }
 
-        return null;
+        // 3. script externo com render= (v3)
+        if (!sitekey) {
+            for (const s of document.scripts) {
+                if (s.src) {
+                    const m = s.src.match(/[?&]render=([^&]+)/);
+                    if (m && m[1] !== 'explicit') {
+                        sitekey = m[1];
+                        versao = 'v3';
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 4. scripts inline
+        if (!sitekey) {
+            for (const s of document.scripts) {
+                const t = s.text || '';
+                const m = t.match(/['"](6L[0-9A-Za-z_-]{30,})['"]/)
+                       || t.match(/sitekey["' :]+([0-9A-Za-z_-]{30,})/);
+                if (m) { sitekey = m[1]; break; }
+            }
+        }
+
+        // Se tem campo action, e' v3
+        if (action && sitekey) versao = 'v3';
+
+        return {sitekey, action, versao};
     }""")
 
+    sitekey = resultado.get("sitekey")
+    action  = resultado.get("action")
+    versao  = resultado.get("versao", "v2")
+
     if sitekey:
-        log_queue.put(f"  Sitekey detectado: {sitekey[:20]}...")
+        log_queue.put(f"  Sitekey detectado ({versao}): {sitekey[:20]}... action={action}")
     else:
         html = page.evaluate("() => document.documentElement.outerHTML.slice(0, 800)")
         log_queue.put(f"  Sitekey nao encontrado. HTML: {html}")
 
-    return sitekey
+    return sitekey, versao, action
 
 
 # ─── RESOLVER CAPTCHA VIA 2CAPTCHA ────────────────────────────────
 
-def resolver_captcha_2captcha(sitekey, page_url, api_key, log_queue):
+def resolver_captcha_2captcha(sitekey, page_url, api_key, log_queue, versao="v2", action=None):
     from twocaptcha import TwoCaptcha
     solver = TwoCaptcha(api_key)
-    log_queue.put(f"  Enviando para 2captcha (sitekey: {sitekey[:20]}...)...")
+    log_queue.put(f"  Enviando para 2captcha ({versao}, action={action})...")
     try:
-        result = solver.recaptcha(sitekey=sitekey, url=page_url)
-        log_queue.put("  Captcha resolvido!")
+        if versao == "v3":
+            result = solver.recaptcha(
+                sitekey=sitekey,
+                url=page_url,
+                version="v3",
+                action=action or "submit",
+                score=0.9,
+            )
+        else:
+            result = solver.recaptcha(sitekey=sitekey, url=page_url)
+        log_queue.put(f"  Captcha resolvido!")
         return result["code"]
     except Exception as e:
         raise Exception(f"2captcha erro: {e}")
@@ -228,16 +261,16 @@ def login_com_2captcha(page, usuario, senha, api_key, log_queue):
     page.locator("input[type='password']").fill(senha)
     log_queue.put("  Senha preenchida.")
 
-    sitekey = detectar_sitekey(page, log_queue)
+    sitekey, versao, action = detectar_sitekey(page, log_queue)
     if sitekey:
-        token = resolver_captcha_2captcha(sitekey, page.url, api_key, log_queue)
+        token = resolver_captcha_2captcha(sitekey, page.url, api_key, log_queue, versao=versao, action=action)
         injetar_token(page, token)
-        # Aguarda navegacao automatica (alguns sites submetem ao receber o token)
+        page.wait_for_timeout(500)
+        # Aguarda navegacao automatica; se nao ocorrer, clica ENTRAR
         try:
             page.wait_for_url("**/perfil.html", timeout=5000)
-            log_queue.put("  Form submetido automaticamente pelo captcha.")
+            log_queue.put("  Form submetido automaticamente.")
         except Exception:
-            # Nao navegou sozinho — clica ENTRAR manualmente
             page.locator("button[type='button']").filter(has_text="ENTRAR").click()
     else:
         log_queue.put("  Nenhum captcha detectado — submetendo direto.")
