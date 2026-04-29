@@ -5,7 +5,6 @@ import streamlit as st
 import threading
 import queue
 import os
-import sys
 import glob
 import platform
 import time
@@ -144,7 +143,14 @@ def login_stealth(page, usuario, senha, log_queue=None):
 
 
 ANTICAPTCHA_KEY_FILE = "/tmp/anticaptcha_key.txt"
-EXTENSION_PATH = "/opt/2captcha-ext/src"
+
+# Detecta caminho correto da extensao (manifest pode estar na raiz ou em src/)
+for _candidate in ["/opt/2captcha-ext/src", "/opt/2captcha-ext"]:
+    if os.path.exists(os.path.join(_candidate, "manifest.json")):
+        EXTENSION_PATH = _candidate
+        break
+else:
+    EXTENSION_PATH = "/opt/2captcha-ext/src"
 
 
 def iniciar_xvfb():
