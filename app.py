@@ -73,7 +73,8 @@ def diagnosticar_pagina(page, log_queue, prefixo=""):
         texto = page.evaluate("() => document.body ? document.body.innerText.slice(0, 800) : ''")
         log_queue.put(f"{prefixo}Texto: {texto}")
         inputs = page.evaluate("""() => Array.from(document.querySelectorAll('input')).map(i =>
-            ({type: i.type, name: i.name, id: i.id, value: i.value.slice(0,10) || '(vazio)'}))""")
+            ({type: i.type, name: i.name, id: i.id,
+              value: (i.name === 'g-recaptcha-response' ? i.value.slice(0,50) : i.value.slice(0,10)) || '(vazio)'}))""")
         log_queue.put(f"{prefixo}Inputs: {inputs}")
         page.screenshot(path="/tmp/amhp_debug.png", full_page=False)
     except Exception as e:
@@ -172,28 +173,57 @@ def resolver_captcha_2captcha(sitekey, page_url, api_key, log_queue, versao="v2"
         raise Exception(f"2captcha erro: {e}")
 
 
-def injetar_token(page, token):
-    page.evaluate("""(token) => {
-        document.querySelectorAll('[name="g-recaptcha-response"], #g-recaptcha-response').forEach(el => {
-            el.removeAttribute('disabled');
-            el.value = token;
-            el.innerHTML = token;
-        });
-        try {
-            const cfg = window.___grecaptcha_cfg;
-            if (cfg && cfg.clients) {
-                const buscar = (obj, n) => {
-                    if (n > 5 || !obj || typeof obj !== 'object') return;
-                    for (const [k, v] of Object.entries(obj)) {
-                        if (typeof v === 'function' && (k === 'callback' || k === 'l')) {
-                            try { v(token); } catch(e) {}
-                        } else { buscar(v, n + 1); }
-                    }
-                };
-                Object.values(cfg.clients).forEach(c => buscar(c, 0));
-            }
-        } catch(e) {}
-    }""", token)
+def injetar_token(page, token, versao="v2"):
+    if versao == "v3":
+        # Para v3: intercepta grecaptcha.execute para retornar nosso token
+        # quando o site chamar execute() no submit do formulario
+        page.evaluate("""(token) => {
+            // Seta o campo diretamente
+            document.querySelectorAll('[name="g-recaptcha-response"], #g-recaptcha-response').forEach(el => {
+                el.removeAttribute('disabled');
+                el.value = token;
+            });
+            // Sobrescreve grecaptcha.execute para retornar nosso token
+            const patchExecute = (obj) => {
+                if (!obj) return;
+                obj.execute = () => Promise.resolve(token);
+                obj.execute_internal = () => Promise.resolve(token);
+                if (obj.enterprise) obj.enterprise.execute = () => Promise.resolve(token);
+            };
+            if (window.grecaptcha) patchExecute(window.grecaptcha);
+            // Garante que mesmo apos recarregar a lib o patch persiste
+            Object.defineProperty(window, 'grecaptcha', {
+                configurable: true,
+                get: function() { return this._grecaptcha_patched; },
+                set: function(v) {
+                    patchExecute(v);
+                    this._grecaptcha_patched = v;
+                }
+            });
+        }""", token)
+    else:
+        # Para v2: injeta token e dispara callback
+        page.evaluate("""(token) => {
+            document.querySelectorAll('[name="g-recaptcha-response"], #g-recaptcha-response').forEach(el => {
+                el.removeAttribute('disabled');
+                el.value = token;
+                el.innerHTML = token;
+            });
+            try {
+                const cfg = window.___grecaptcha_cfg;
+                if (cfg && cfg.clients) {
+                    const buscar = (obj, n) => {
+                        if (n > 5 || !obj || typeof obj !== 'object') return;
+                        for (const [k, v] of Object.entries(obj)) {
+                            if (typeof v === 'function' && (k === 'callback' || k === 'l')) {
+                                try { v(token); } catch(e) {}
+                            } else { buscar(v, n + 1); }
+                        }
+                    };
+                    Object.values(cfg.clients).forEach(c => buscar(c, 0));
+                }
+            } catch(e) {}
+        }""", token)
 
 
 # ─── FLUXOS DE LOGIN ──────────────────────────────────────────────
@@ -264,7 +294,7 @@ def login_com_2captcha(page, usuario, senha, api_key, log_queue):
     sitekey, versao, action = detectar_sitekey(page, log_queue)
     if sitekey:
         token = resolver_captcha_2captcha(sitekey, page.url, api_key, log_queue, versao=versao, action=action)
-        injetar_token(page, token)
+        injetar_token(page, token, versao=versao)
         page.wait_for_timeout(500)
         # Aguarda navegacao automatica; se nao ocorrer, clica ENTRAR
         try:
