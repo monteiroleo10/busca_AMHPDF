@@ -1,0 +1,8 @@
+build/
+dist/
+*.spec
+*.pyc
+__pycache__/
+.claude/
+*.bat
+exportar_extrato_amhp.py
