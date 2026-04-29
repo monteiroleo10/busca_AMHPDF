@@ -479,7 +479,7 @@ if st.session_state.step == "input":
 elif st.session_state.step == "buscando":
     log_queue  = st.session_state.log_queue
     thread     = st.session_state.browser_thread
-    ESTIMATIVA = 28  # segundos estimados para login + busca
+    ESTIMATIVA = 55  # segundos estimados para login + busca
 
     st.markdown("**Buscando referências disponíveis...**")
     progress_bar      = st.progress(0.0)
@@ -640,6 +640,9 @@ if os.path.exists("logo_b4strategy.png"):
     st.markdown(f"""
 <div class="dev-footer">
     Desenvolvido por<br>
-    <img src="data:image/png;base64,{logo_b64}" height="32" style="margin-top:6px; opacity:0.85;">
+    <img src="data:image/png;base64,{logo_b64}" height="32" style="margin-top:6px; opacity:0.85;"><br>
+    <a href="mailto:contato@b4strategy.com.br" style="color:#4A90C4; text-decoration:none; font-size:0.75rem;">
+        contato@b4strategy.com.br
+    </a>
 </div>
 """, unsafe_allow_html=True)
