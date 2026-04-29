@@ -1,21 +1,15 @@
 FROM python:3.11-slim
 
 RUN apt-get update && apt-get install -y \
-    wget xvfb \
+    wget \
     && rm -rf /var/lib/apt/lists/*
-
-# Extensao 2captcha para Chromium
-RUN wget -qO /tmp/2captcha.tar.gz https://github.com/2captcha/2captcha-solver/archive/refs/heads/main.tar.gz \
-    && mkdir -p /opt/2captcha-ext \
-    && tar -xzf /tmp/2captcha.tar.gz -C /opt/2captcha-ext --strip-components=1 \
-    && rm /tmp/2captcha.tar.gz
 
 WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-RUN playwright install chromium
-RUN playwright install-deps chromium
+RUN playwright install firefox
+RUN playwright install-deps firefox
 
 COPY . .
 
