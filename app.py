@@ -277,8 +277,8 @@ def detectar_sitekey(page, log_queue):
             const text = s.text || '';
             const patterns = [
                 /['"](6L[0-9A-Za-z_-]{30,})['"]/,
-                /sitekey['":\s]+['"]([\w-]{30,})['"]/i,
-                /grecaptcha\.render\([^)]*['"]([\w-]{30,})['"]/,
+                /sitekey['":\\s]+['"]([\\w-]{30,})['"]/i,
+                /grecaptcha\\.render\\([^)]*['"]([\\w-]{30,})['"]/,
             ];
             for (const re of patterns) {
                 const m = text.match(re);
