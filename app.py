@@ -9,6 +9,7 @@ import glob
 import platform
 import time
 import urllib.parse
+import base64
 import pandas as pd
 from playwright.sync_api import sync_playwright
 
@@ -382,7 +383,73 @@ def rodar_exportacao(usuario, senha, quantidade, api_key, log_queue):
 # ─── INTERFACE STREAMLIT ──────────────────────────────────────────
 
 st.set_page_config(page_title="Exportar Extrato AMHP", page_icon="📊", layout="centered")
-st.title("Exportar Extrato AMHP")
+
+st.markdown("""
+<style>
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
+
+    .block-container {
+        padding-top: 1.5rem;
+        padding-bottom: 1rem;
+        max-width: 520px;
+    }
+
+    [data-testid="stForm"] {
+        background: #FFFFFF;
+        border-radius: 12px;
+        padding: 1.5rem 2rem 1rem 2rem;
+        box-shadow: 0 2px 16px rgba(14, 31, 59, 0.10);
+        border: 1px solid #c5d8ea;
+    }
+
+    .stButton > button {
+        background-color: #0E1F3B !important;
+        color: #FFFFFF !important;
+        border: none !important;
+        border-radius: 8px !important;
+        font-weight: 600 !important;
+        font-size: 1rem !important;
+        transition: background 0.2s !important;
+    }
+
+    .stButton > button:hover {
+        background-color: #4A90C4 !important;
+    }
+
+    .stTextInput > div > div > input,
+    .stNumberInput input {
+        border-radius: 6px !important;
+        border: 1.5px solid #c5d8ea !important;
+    }
+
+    [data-testid="stCodeBlock"] pre {
+        background-color: #0E1F3B !important;
+        color: #D6E4F0 !important;
+        border-radius: 8px !important;
+        font-size: 0.82rem !important;
+    }
+
+    .dev-footer {
+        text-align: center;
+        margin-top: 2.5rem;
+        padding-top: 1rem;
+        border-top: 1px solid #c5d8ea;
+        color: #666;
+        font-size: 0.78rem;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Logo AMHP
+if os.path.exists("amhplogo.png"):
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.image("amhplogo.png", use_container_width=True)
+    st.markdown("<br>", unsafe_allow_html=True)
+else:
+    st.title("Exportar Extrato AMHP")
 
 api_key = carregar_api_key()
 
@@ -451,3 +518,14 @@ if iniciar:
                 st.subheader("Screenshot no momento da falha")
                 with open("/tmp/amhp_debug.png", "rb") as f:
                     st.image(f.read(), caption="Estado da pagina ao falhar o login")
+
+# Rodapé com logo do desenvolvedor
+if os.path.exists("logo_b4strategy.png"):
+    with open("logo_b4strategy.png", "rb") as f:
+        logo_b64 = base64.b64encode(f.read()).decode()
+    st.markdown(f"""
+<div class="dev-footer">
+    Desenvolvido por<br>
+    <img src="data:image/png;base64,{logo_b64}" height="32" style="margin-top:6px; opacity:0.85;">
+</div>
+""", unsafe_allow_html=True)
