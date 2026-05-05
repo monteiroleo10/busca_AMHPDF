@@ -1,14 +1,6 @@
-FROM python:3.11-slim
+FROM python:3.11-slim-bookworm
 
-RUN apt-get update && apt-get install -y \
-    wget xvfb \
-    && rm -rf /var/lib/apt/lists/*
-
-# Extensao 2captcha para Chromium
-RUN wget -qO /tmp/2captcha.tar.gz https://github.com/2captcha/2captcha-solver/archive/refs/heads/main.tar.gz \
-    && mkdir -p /opt/2captcha-ext \
-    && tar -xzf /tmp/2captcha.tar.gz -C /opt/2captcha-ext --strip-components=1 \
-    && rm /tmp/2captcha.tar.gz
+RUN apt-get update && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 

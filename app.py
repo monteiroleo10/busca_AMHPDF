@@ -8,340 +8,138 @@ import os
 import glob
 import platform
 import time
+import re
+import urllib.parse
+import base64
 import pandas as pd
+import openpyxl
 from playwright.sync_api import sync_playwright
 
-# Pasta de destino: temporaria no servidor, Downloads no Windows local
+
+# ─── CONFIGURACAO ─────────────────────────────────────────────────
+
 if platform.system() == "Windows":
     PASTA_DESTINO = os.path.join(os.environ.get("USERPROFILE", ""), "Downloads")
 else:
     PASTA_DESTINO = "/tmp/extratos_amhp"
 
-def cookies_file(usuario):
-    digitos = ''.join(c for c in usuario if c.isdigit())[:6]
-    return f"/tmp/amhp_cookies_{digitos}.json"
-
 HEADLESS = platform.system() != "Windows"
 
 
-# ─── LOGICA DE EXPORTACAO ─────────────────────────────────────────
+def carregar_api_key():
+    return os.environ.get("ANTICAPTCHA_KEY", "")
+
 
 def encontrar_chromium():
-    """Localiza o Chromium no Windows. No Linux o Playwright resolve sozinho."""
+    """Localiza o Chromium instalado pelo Playwright no Windows."""
     possiveis = [
         os.path.join(os.environ.get("LOCALAPPDATA", ""), "ms-playwright"),
         os.path.join(os.environ.get("USERPROFILE", ""), "AppData", "Local", "ms-playwright"),
     ]
     for base in possiveis:
-        for pasta_chrome in ["chrome-win64", "chrome-win"]:
-            matches = glob.glob(os.path.join(base, "chromium*", pasta_chrome, "chrome.exe"))
+        for pasta in ["chrome-win64", "chrome-win"]:
+            matches = glob.glob(os.path.join(base, "chromium*", pasta, "chrome.exe"))
             if matches:
                 return sorted(matches)[-1]
     return None
 
 
-def login_http(usuario, senha):
-    """Tenta login via HTTP direto sem navegador. Retorna cookies se funcionar."""
-    import requests
-    from bs4 import BeautifulSoup
-
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-        "Referer": "https://portal.amhp.com.br/",
-    })
-
-    # Obtém a página de login para capturar tokens
-    resp = session.get("https://portal.amhp.com.br/", timeout=30)
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    # Monta payload com campos ocultos do formulário
-    payload = {"username": usuario, "password": senha}
-    for inp in soup.find_all("input", {"type": "hidden"}):
-        if inp.get("name"):
-            payload[inp["name"]] = inp.get("value", "")
-
-    # Tenta POST na raiz e em endpoints comuns
-    for endpoint in [
-        "https://portal.amhp.com.br/",
-        "https://portal.amhp.com.br/login",
-        "https://portal.amhp.com.br/api/login",
-    ]:
-        r = session.post(endpoint, data=payload, timeout=30, allow_redirects=True)
-        if "perfil" in r.url or "perfil" in r.text.lower():
-            # Login funcionou — retorna cookies no formato Playwright
-            cookies = []
-            for c in session.cookies:
-                cookies.append({
-                    "name": c.name,
-                    "value": c.value,
-                    "domain": c.domain or "portal.amhp.com.br",
-                    "path": c.path or "/",
-                    "sameSite": "Lax",
-                })
-            return cookies
-    return None
-
-
-def validar_sessao(page):
-    """Verifica se a sessão está autenticada acessando uma página protegida."""
-    page.goto("https://portal.amhp.com.br/pages/PJ/perfil.html")
-    page.wait_for_load_state("networkidle")
-    # Se não estiver logado, redireciona para a página de login
-    if "perfil" not in page.url:
-        return False
-    return True
-
+# ─── DIAGNOSTICO ──────────────────────────────────────────────────
 
 def diagnosticar_pagina(page, log_queue, prefixo=""):
-    """Loga URL, titulo, texto visivel e salva screenshot para diagnostico."""
     try:
         log_queue.put(f"{prefixo}URL: {page.url}")
         log_queue.put(f"{prefixo}Titulo: {page.title()}")
         texto = page.evaluate("() => document.body ? document.body.innerText.slice(0, 600) : ''")
         log_queue.put(f"{prefixo}Texto: {texto}")
-        screenshot_path = "/tmp/amhp_debug.png"
-        page.screenshot(path=screenshot_path, full_page=False)
-        log_queue.put(f"{prefixo}Screenshot salvo em {screenshot_path}")
+        inputs = page.evaluate("""() => Array.from(document.querySelectorAll('input')).map(i => ({
+            type: i.type, name: i.name, id: i.id,
+            value: (i.name === 'g-recaptcha-response' ? i.value.slice(0, 50) : i.value.slice(0, 10)) || '(vazio)'
+        }))""")
+        log_queue.put(f"{prefixo}Inputs: {inputs}")
+        page.screenshot(path="/tmp/amhp_debug.png", full_page=False)
     except Exception as e:
         log_queue.put(f"{prefixo}Erro no diagnostico: {e}")
 
 
-def login_stealth(page, usuario, senha, log_queue=None):
-    """Tenta login com Playwright disfarçado de navegador humano."""
-    try:
-        from playwright_stealth import stealth_sync
-        stealth_sync(page)
-    except Exception:
-        pass
-
-    page.goto("https://portal.amhp.com.br/")
-    page.wait_for_load_state("networkidle")
-    page.wait_for_timeout(2000)
-
-    if log_queue:
-        diagnosticar_pagina(page, log_queue, "  [pre-login] ")
-
-    try:
-        page.locator("input[type='text']").last.fill(usuario)
-        page.locator("input[type='password']").fill(senha)
-        page.locator("button[type='button']").filter(has_text="ENTRAR").click()
-    except Exception as e:
-        if log_queue:
-            log_queue.put(f"  Erro ao preencher formulario: {e}")
-        return False
-
-    try:
-        page.wait_for_url("**/perfil.html", timeout=15000)
-    except Exception:
-        page.wait_for_load_state("networkidle")
-
-    if log_queue:
-        diagnosticar_pagina(page, log_queue, "  [pos-login] ")
-
-    return "perfil" in page.url
-
-
-ANTICAPTCHA_KEY_FILE = "/tmp/anticaptcha_key.txt"
-
-# Detecta caminho correto da extensao (manifest pode estar na raiz ou em src/)
-for _candidate in ["/opt/2captcha-ext/src", "/opt/2captcha-ext"]:
-    if os.path.exists(os.path.join(_candidate, "manifest.json")):
-        EXTENSION_PATH = _candidate
-        break
-else:
-    EXTENSION_PATH = "/opt/2captcha-ext/src"
-
-
-def iniciar_xvfb():
-    import subprocess
-    proc = subprocess.Popen(
-        ["Xvfb", ":99", "-screen", "0", "1280x720x24", "-ac"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    os.environ["DISPLAY"] = ":99"
-    time.sleep(1)
-    return proc
-
-
-def configurar_api_key_extensao(context, api_key, log_queue):
-    """Injeta a API key na extensao 2captcha via background page ou service worker."""
-    time.sleep(2)
-    script = "(key) => chrome.storage.local.set({apiKey: key, autoSolve: true, solveRecaptchaV2: true, solveRecaptchaV3: true, solveHCaptcha: true})"
-    try:
-        pages = context.background_pages
-        if not pages:
-            time.sleep(3)
-            pages = context.background_pages
-        if pages:
-            pages[0].evaluate(script, api_key)
-            log_queue.put("  API key configurada na extensao (background page).")
-            return
-    except Exception:
-        pass
-    try:
-        workers = context.service_workers
-        if not workers:
-            time.sleep(3)
-            workers = context.service_workers
-        if workers:
-            workers[0].evaluate(script, api_key)
-            log_queue.put("  API key configurada na extensao (service worker).")
-            return
-    except Exception:
-        pass
-    log_queue.put("  Aviso: nao foi possivel configurar API key automaticamente — verifique se a extensao carregou.")
-
-def salvar_anticaptcha_key(api_key):
-    with open(ANTICAPTCHA_KEY_FILE, "w") as f:
-        f.write(api_key.strip())
-
-def carregar_anticaptcha_key():
-    if os.path.exists(ANTICAPTCHA_KEY_FILE):
-        with open(ANTICAPTCHA_KEY_FILE, "r") as f:
-            return f.read().strip()
-    return os.environ.get("ANTICAPTCHA_KEY", "")
-
-
-def salvar_cookies(usuario, cookies_json):
-    with open(cookies_file(usuario), "w") as f:
-        f.write(cookies_json)
-
-
-def carregar_cookies_salvos(usuario):
-    path = cookies_file(usuario)
-    if os.path.exists(path):
-        with open(path, "r") as f:
-            return f.read()
-    return None
-
-
-def resolver_recaptcha(sitekey, pageurl, api_key, log_queue):
-    """Envia o reCAPTCHA para o 2captcha e retorna o token resolvido."""
-    import requests as req
-
-    log_queue.put("  Enviando reCAPTCHA para o 2captcha...")
-    r = req.post("http://2captcha.com/in.php", data={
-        "key": api_key,
-        "method": "userrecaptcha",
-        "googlekey": sitekey,
-        "pageurl": pageurl,
-        "json": 1,
-    }, timeout=30)
-    resultado = r.json()
-    if resultado.get("status") != 1:
-        raise Exception(f"2captcha erro ao enviar: {resultado.get('request')}")
-
-    captcha_id = resultado["request"]
-    log_queue.put(f"  reCAPTCHA enviado (id={captcha_id}). Aguardando resolucao...")
-
-    for tentativa in range(24):  # ate 2 minutos
-        time.sleep(5)
-        r = req.get("http://2captcha.com/res.php", params={
-            "key": api_key,
-            "action": "get",
-            "id": captcha_id,
-            "json": 1,
-        }, timeout=30)
-        resultado = r.json()
-        if resultado.get("status") == 1:
-            log_queue.put("  reCAPTCHA resolvido!")
-            return resultado["request"]
-        if resultado.get("request") != "CAPCHA_NOT_READY":
-            raise Exception(f"2captcha erro na resolucao: {resultado.get('request')}")
-        log_queue.put(f"  Aguardando... ({(tentativa+1)*5}s)")
-
-    raise Exception("2captcha timeout: reCAPTCHA nao resolvido em 2 minutos")
-
+# ─── DETECCAO DE SITEKEY ──────────────────────────────────────────
 
 def detectar_sitekey(page, log_queue):
-    """Detecta o sitekey do reCAPTCHA usando multiplas estrategias."""
-    # Aguarda scripts de captcha carregarem
-    page.wait_for_timeout(3000)
+    try:
+        page.wait_for_function(
+            "() => Array.from(document.scripts).some(s => s.src && s.src.includes('recaptcha'))",
+            timeout=3000,
+        )
+    except Exception:
+        pass
 
-    sitekey = page.evaluate("""() => {
-        // 1. Atributo data-sitekey em qualquer elemento
+    resultado = page.evaluate("""() => {
+        let sitekey = null, action = null, versao = 'v2';
+
+        const actionEl = document.querySelector('input[name="action"]');
+        if (actionEl) action = actionEl.value;
+
+        // data-sitekey (v2 widget)
         const el = document.querySelector('[data-sitekey]');
-        if (el) return el.getAttribute('data-sitekey');
+        if (el) sitekey = el.getAttribute('data-sitekey');
 
-        // 2. Sitekey no src do iframe do reCAPTCHA
-        const iframes = document.querySelectorAll('iframe[src*="recaptcha"], iframe[src*="google.com/recaptcha"]');
-        for (const f of iframes) {
-            const m = f.src.match(/[?&]k=([^&]+)/);
-            if (m) return m[1];
-        }
-
-        // 3. Sitekey em scripts inline
-        for (const s of document.scripts) {
-            const text = s.text || '';
-            const patterns = [
-                /['"](6L[0-9A-Za-z_-]{30,})['"]/,
-                /sitekey['":\\s]+['"]([\\w-]{30,})['"]/i,
-                /grecaptcha\\.render\\([^)]*['"]([\\w-]{30,})['"]/,
-            ];
-            for (const re of patterns) {
-                const m = text.match(re);
-                if (m) return m[1];
+        // iframe do reCAPTCHA (v2)
+        if (!sitekey) {
+            for (const f of document.querySelectorAll('iframe')) {
+                const m = f.src.match(/[?&]k=([^&]+)/);
+                if (m) { sitekey = m[1]; break; }
             }
         }
 
-        // 4. Sitekey em src de scripts externos
-        for (const s of document.scripts) {
-            if (s.src) {
-                const m = s.src.match(/[?&]render=([^&]+)/);
-                if (m && m[1] !== 'explicit') return m[1];
-            }
-        }
-
-        return null;
-    }""")
-
-    if sitekey:
-        log_queue.put(f"  Sitekey encontrado: {sitekey[:20]}...")
-    else:
-        # Loga HTML resumido para diagnostico
-        html_resumo = page.evaluate("() => document.documentElement.outerHTML.slice(0, 1000)")
-        log_queue.put(f"  Sitekey nao encontrado. HTML inicial: {html_resumo}")
-
-    return sitekey
-
-
-def injetar_token_recaptcha(page, token):
-    """Injeta o token resolvido e dispara os callbacks do grecaptcha."""
-    page.evaluate("""(token) => {
-        // Seta todos os campos g-recaptcha-response
-        document.querySelectorAll('[name="g-recaptcha-response"], #g-recaptcha-response').forEach(el => {
-            el.removeAttribute('disabled');
-            el.value = token;
-            el.innerHTML = token;
-        });
-
-        // Dispara callbacks registrados no grecaptcha
-        try {
-            const cfg = window.___grecaptcha_cfg;
-            if (cfg && cfg.clients) {
-                for (const client of Object.values(cfg.clients)) {
-                    // Percorre o objeto procurando funcoes de callback
-                    const visitar = (obj, profundidade) => {
-                        if (profundidade > 6 || !obj || typeof obj !== 'object') return;
-                        for (const [k, v] of Object.entries(obj)) {
-                            if (typeof v === 'function' && (k === 'callback' || k === 'l')) {
-                                try { v(token); } catch(e) {}
-                            } else {
-                                visitar(v, profundidade + 1);
-                            }
-                        }
-                    };
-                    visitar(client, 0);
+        // script externo com render= (v3)
+        if (!sitekey) {
+            for (const s of document.scripts) {
+                if (s.src) {
+                    const m = s.src.match(/[?&]render=([^&]+)/);
+                    if (m && m[1] !== 'explicit') { sitekey = m[1]; versao = 'v3'; break; }
                 }
             }
-        } catch(e) {}
-    }""", token)
+        }
+
+        // scripts inline
+        if (!sitekey) {
+            for (const s of document.scripts) {
+                const t = s.text || '';
+                const m = t.match(/['"](6L[0-9A-Za-z_-]{30,})['"]/)
+                       || t.match(/sitekey["' :]+([0-9A-Za-z_-]{30,})/);
+                if (m) { sitekey = m[1]; break; }
+            }
+        }
+
+        if (action && sitekey) versao = 'v3';
+        return { sitekey, action, versao };
+    }""")
+
+    sitekey = resultado.get("sitekey")
+    action  = resultado.get("action")
+    versao  = resultado.get("versao", "v2")
+
+    return sitekey, versao, action
 
 
-def login_com_anticaptcha(page, usuario, senha, api_key, log_queue):
-    """Faz login resolvendo o reCAPTCHA via 2captcha."""
+# ─── 2CAPTCHA ─────────────────────────────────────────────────────
+
+def resolver_captcha(sitekey, page_url, api_key, log_queue, versao="v2", action=None):
+    from twocaptcha import TwoCaptcha
+    solver = TwoCaptcha(api_key)
+    if versao == "v3":
+        result = solver.recaptcha(
+            sitekey=sitekey, url=page_url,
+            version="v3", action=action or "submit", score=0.9,
+        )
+    else:
+        result = solver.recaptcha(sitekey=sitekey, url=page_url)
+    return result["code"]
+
+
+# ─── LOGIN ────────────────────────────────────────────────────────
+
+def login_com_2captcha(page, usuario, senha, api_key, log_queue):
     try:
         from playwright_stealth import stealth_sync
         stealth_sync(page)
@@ -351,81 +149,82 @@ def login_com_anticaptcha(page, usuario, senha, api_key, log_queue):
     page.goto("https://portal.amhp.com.br/")
     page.wait_for_load_state("networkidle")
 
-    sitekey = detectar_sitekey(page, log_queue)
+    for selector in ["input[name='username']", "input[name='user']", "input[type='text']"]:
+        try:
+            loc = page.locator(selector).last
+            if loc.count() > 0:
+                loc.fill(usuario)
+                break
+        except Exception:
+            continue
 
-    if sitekey:
-        log_queue.put("  Resolvendo reCAPTCHA via 2captcha...")
-        token = resolver_recaptcha(sitekey, page.url, api_key, log_queue)
-        injetar_token_recaptcha(page, token)
-        page.wait_for_timeout(1000)
-    else:
-        log_queue.put("  Nenhum reCAPTCHA detectado — tentando login direto.")
-
-    page.locator("input[type='text']").last.fill(usuario)
     page.locator("input[type='password']").fill(senha)
-    page.locator("button[type='button']").filter(has_text="ENTRAR").click()
 
+    sitekey, versao, action = detectar_sitekey(page, log_queue)
+    if not sitekey:
+        raise Exception("Sitekey do reCAPTCHA nao encontrado na pagina de login.")
+
+    token = resolver_captcha(sitekey, page.url, api_key, log_queue, versao=versao, action=action)
+
+    interceptado = [False]
+
+    def trocar_token(route, request):
+        if request.method == "POST" and "portal.amhp.com.br" in request.url:
+            pd = request.post_data or ""
+            if "g-recaptcha-response" in pd:
+                try:
+                    params = dict(urllib.parse.parse_qsl(pd, keep_blank_values=True))
+                    params["g-recaptcha-response"] = token
+                    interceptado[0] = True
+                    route.continue_(post_data=urllib.parse.urlencode(params))
+                    return
+                except Exception:
+                    pass
+        route.continue_()
+
+    page.route("**/*", trocar_token)
     try:
-        page.wait_for_url("**/perfil.html", timeout=20000)
-    except Exception:
-        page.wait_for_load_state("networkidle")
+        page.locator("button[type='button']").filter(has_text="ENTRAR").click()
+        try:
+            page.wait_for_url("**/perfil.html", timeout=20000)
+        except Exception:
+            page.wait_for_load_state("networkidle")
+    finally:
+        page.unroute("**/*", trocar_token)
 
     return "perfil" in page.url
 
 
-def login_com_cookies(context, cookies_json):
-    import json
-    cookies = json.loads(cookies_json)
-    mapa_samesite = {
-        "strict": "Strict",
-        "lax": "Lax",
-        "none": "None",
-        "no_restriction": "None",
-        "unspecified": "Lax",
-    }
-    for c in cookies:
-        c.setdefault("path", "/")
-        raw = str(c.get("sameSite", "lax")).lower()
-        c["sameSite"] = mapa_samesite.get(raw, "Lax")
-        for campo in ["hostOnly", "session", "storeId", "id", "expirationDate"]:
-            c.pop(campo, None)
-    context.add_cookies(cookies)
-
-
-def navegar_para_extrato(page, log_queue):
+def validar_sessao(page):
     page.goto("https://portal.amhp.com.br/pages/PJ/perfil.html")
     page.wait_for_load_state("networkidle")
-    page.wait_for_timeout(5000)
+    return "perfil" in page.url
 
-    # Loga iframes e texto visível da página para diagnóstico
-    iframes = page.evaluate("() => Array.from(document.querySelectorAll('iframe')).map(f => f.src || f.name || 'sem-src')")
-    log_queue.put(f"  Iframes: {iframes}")
-    texto = page.evaluate("() => document.body.innerText.slice(0, 500)")
-    log_queue.put(f"  Texto da pagina: {texto}")
 
-    # Tenta clicar pelo texto
+# ─── NAVEGACAO E EXPORTACAO ───────────────────────────────────────
+
+def navegar_para_extrato(page, log_queue):
+    # Após login bem-sucedido já estamos em perfil.html — sem goto redundante
     try:
-        page.get_by_text("AMHPTISS", exact=False).first.click(timeout=10000)
-        page.wait_for_load_state("networkidle")
-        log_queue.put(f"  URL apos clique: {page.url}")
-    except Exception as e:
-        log_queue.put(f"  Clique falhou: {e}")
+        page.wait_for_selector("text=AMHPTISS", timeout=8000)
+        page.get_by_text("AMHPTISS", exact=False).first.click()
+        page.wait_for_load_state("load")
+    except Exception:
+        pass
 
     page.goto("https://amhptiss.amhp.com.br/Extrato.aspx")
     page.wait_for_load_state("networkidle")
-    log_queue.put(f"  Extrato URL: {page.url}")
     return page
 
 
 def obter_referencias_disponiveis(page):
-    # Abre o dropdown e lê os itens diretamente do DOM
     page.locator("#ctl00_MainContent_rcbReferencia_Input").click()
     page.wait_for_selector("li.rcbItem", timeout=15000)
-    refs = page.evaluate("""() => {
-        return Array.from(document.querySelectorAll('li.rcbItem'))
+    refs = page.evaluate("""() =>
+        Array.from(document.querySelectorAll('li.rcbItem'))
             .map(el => el.textContent.trim())
-            .filter(t => t.length > 0);
-    }""")
+            .filter(t => t.length > 0)
+    """)
     page.keyboard.press("Escape")
     page.wait_for_timeout(500)
     return refs
@@ -452,34 +251,29 @@ def exportar_csv(page, texto_referencia, usuario):
         page.wait_for_timeout(1000)
 
         popup = page.frame_locator("iframe[src*='ExtratoExportacao'][tabindex='0']")
-
         try:
             popup.locator("a.rlbTransferAllFrom").first.click(timeout=5000)
         except Exception:
             pass
         page.wait_for_timeout(1000)
 
-        with page.expect_download(timeout=120000) as download_info:
+        with page.expect_download(timeout=120000) as dl:
             popup.locator("#rbtExportarCsv_input").click(timeout=10000)
 
-        download = download_info.value
+        download = dl.value
         os.makedirs(PASTA_DESTINO, exist_ok=True)
         prefixo = ''.join(c for c in usuario if c.isdigit())[:6]
-        nome_arquivo = (
-            prefixo + "_Extrato_"
-            + texto_referencia
-              .replace("ª", "a").replace("ç", "c").replace("ã", "a")
-              .replace("é", "e").replace("ê", "e").replace("á", "a")
-              .replace("â", "a").replace("ó", "o").replace("ô", "o")
-              .replace("ú", "u").replace("/", "_").replace(" ", "_")
-            + ".csv"
-        )
-        caminho = os.path.join(PASTA_DESTINO, nome_arquivo)
+        nome = (prefixo + "_Extrato_"
+                + texto_referencia
+                  .replace("ª", "a").replace("ç", "c").replace("ã", "a")
+                  .replace("é", "e").replace("ê", "e").replace("á", "a")
+                  .replace("â", "a").replace("ó", "o").replace("ô", "o")
+                  .replace("ú", "u").replace("/", "_").replace(" ", "_")
+                + ".csv")
+        caminho = os.path.join(PASTA_DESTINO, nome)
         download.save_as(caminho)
     finally:
-        page.evaluate("""
-            document.querySelectorAll('[id^="RadWindowWrapper_"], .TelerikModalOverlay').forEach(el => el.remove());
-        """)
+        page.evaluate("document.querySelectorAll('[id^=\"RadWindowWrapper_\"], .TelerikModalOverlay').forEach(el => el.remove())")
         page.wait_for_timeout(500)
 
     return caminho
@@ -501,263 +295,416 @@ def consolidar_excel(arquivos, usuario):
     return nome_excel
 
 
-def rodar_exportacao(usuario, senha, quantidade, cookies_json, api_key, log_queue):
-    arquivos_exportados = []
-    xvfb_proc = None
-    usar_extensao = (
-        platform.system() != "Windows"
-        and bool(api_key)
-        and os.path.isdir(EXTENSION_PATH)
+# ─── FLUXO PRINCIPAL ──────────────────────────────────────────────
+
+def _criar_browser(p):
+    if platform.system() == "Windows":
+        return p.chromium.launch(headless=HEADLESS, executable_path=encontrar_chromium())
+    return p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+
+
+def _criar_context(browser):
+    return browser.new_context(
+        accept_downloads=True,
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     )
 
+
+def sessao_unica_thread(usuario, senha, api_key, log_queue, cmd_queue):
     try:
-        chromium_exe = encontrar_chromium() if platform.system() == "Windows" else None
-        prefixo_usuario = ''.join(c for c in usuario if c.isdigit())[:6]
-
-        log_queue.put("Iniciando navegador...")
+        log_queue.put("Iniciando sessão...")
         with sync_playwright() as p:
+            browser = _criar_browser(p)
+            page = _criar_context(browser).new_page()
 
-            # ── Lança o navegador correto ──────────────────────────
-            if usar_extensao:
-                log_queue.put("Iniciando display virtual + Chromium com extensao 2captcha...")
-                xvfb_proc = iniciar_xvfb()
-                context = p.chromium.launch_persistent_context(
-                    user_data_dir=f"/tmp/chrome_{prefixo_usuario}",
-                    headless=False,
-                    accept_downloads=True,
-                    args=[
-                        f"--disable-extensions-except={EXTENSION_PATH}",
-                        f"--load-extension={EXTENSION_PATH}",
-                        "--no-sandbox",
-                        "--disable-dev-shm-usage",
-                        "--disable-gpu",
-                        "--window-size=1280,720",
-                    ],
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-                )
-                configurar_api_key_extensao(context, api_key, log_queue)
-                browser = None
-            elif platform.system() == "Windows":
-                browser = p.chromium.launch(headless=HEADLESS, executable_path=chromium_exe)
-                context = browser.new_context(
-                    accept_downloads=True,
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-                )
-            else:
-                browser = p.firefox.launch(headless=True)
-                context = browser.new_context(
-                    accept_downloads=True,
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-                )
+            log_queue.put("Autenticando...")
+            ok = login_com_2captcha(page, usuario, senha, api_key, log_queue)
 
-            page = context.new_page()
-            autenticado = False
+            if not ok:
+                raise Exception("Login falhou. Verifique CPF/CNPJ, senha e saldo no 2captcha.")
 
-            # ── Login com extensao 2captcha (Linux + API key) ──────
-            if usar_extensao:
-                log_queue.put("Fazendo login — extensao 2captcha resolve o captcha automaticamente...")
-                try:
-                    from playwright_stealth import stealth_sync
-                    stealth_sync(page)
-                except Exception:
-                    pass
-
-                page.goto("https://portal.amhp.com.br/")
-                page.wait_for_load_state("networkidle")
-                page.wait_for_timeout(2000)
-
-                diagnosticar_pagina(page, log_queue, "  [pre-login] ")
-
-                page.locator("input[type='text']").last.fill(usuario)
-                page.locator("input[type='password']").fill(senha)
-                log_queue.put("  Clicando em ENTRAR — aguardando 2captcha (ate 2 min)...")
-                page.locator("button[type='button']").filter(has_text="ENTRAR").click()
-
-                try:
-                    page.wait_for_url("**/perfil.html", timeout=120000)
-                except Exception:
-                    page.wait_for_load_state("networkidle")
-
-                diagnosticar_pagina(page, log_queue, "  [pos-login] ")
-
-                if "perfil" in page.url and validar_sessao(page):
-                    log_queue.put("Login com extensao 2captcha funcionou!")
-                    autenticado = True
-                else:
-                    log_queue.put("Login com extensao falhou — tentando cookies...")
-
-            # ── Fluxo legado: HTTP + stealth (Windows ou sem extensao) ──
-            if not autenticado and not usar_extensao:
-                log_queue.put("Tentando login via HTTP...")
-                cookies_http = login_http(usuario, senha)
-                if cookies_http:
-                    context.add_cookies(cookies_http)
-                    if validar_sessao(page):
-                        log_queue.put("Login via HTTP funcionou!")
-                        autenticado = True
-
-                if not autenticado:
-                    log_queue.put("Tentando login stealth...")
-                    ok = login_stealth(page, usuario, senha, log_queue)
-                    if ok and validar_sessao(page):
-                        log_queue.put("Login stealth funcionou!")
-                        autenticado = True
-
-            # ── Fallback: cookies colados ou salvos ────────────────
-            if not autenticado:
-                cookies_limpo = (cookies_json or "").strip()
-                if not (cookies_limpo and cookies_limpo.startswith("[")):
-                    cookies_limpo = carregar_cookies_salvos(usuario) or ""
-
-                if cookies_limpo and cookies_limpo.startswith("["):
-                    log_queue.put("Usando cookies para autenticacao...")
-                    login_com_cookies(context, cookies_limpo)
-                    if validar_sessao(page):
-                        salvar_cookies(usuario, cookies_limpo)
-                        log_queue.put("Sessao validada com cookies!")
-                        autenticado = True
-                    else:
-                        cf = cookies_file(usuario)
-                        if os.path.exists(cf):
-                            os.remove(cf)
-                        raise Exception(
-                            "Cookies invalidos ou expirados.\n\n"
-                            "Renove: faca login em portal.amhp.com.br, exporte via Cookie-Editor e cole no campo 'Cookies'."
-                        )
-                else:
-                    raise Exception(
-                        "Nao foi possivel autenticar automaticamente.\n\n"
-                        "Cole os cookies no campo 'Cookies' do formulario:\n"
-                        "1. Faca login em portal.amhp.com.br\n"
-                        "2. Cookie-Editor > Export > Export as JSON\n"
-                        "3. Cole o JSON no app"
-                    )
-
-            # ── Exportacao ─────────────────────────────────────────
-            log_queue.put("Navegando para o Extrato...")
+            log_queue.put("Login realizado! Buscando referências disponíveis...")
             page = navegar_para_extrato(page, log_queue)
-            log_queue.put("Extrato carregado!")
+            refs = obter_referencias_disponiveis(page)
+            log_queue.put(f"{len(refs)} referência(s) encontrada(s).")
+            log_queue.put(("REFERENCIAS", refs))
 
-            todas = obter_referencias_disponiveis(page)
-            referencias = todas[:quantidade]
+            # Pausa aqui aguardando a seleção do usuário
+            selecionadas = cmd_queue.get()
 
-            log_queue.put(f"Referencias selecionadas ({quantidade} mais recentes):")
-            for i, ref in enumerate(referencias):
-                log_queue.put(f"  [{i+1}] {ref}")
+            if selecionadas is None:
+                browser.close()
+                return
 
-            for i, ref in enumerate(referencias):
-                log_queue.put(f"Exportando [{i+1}/{len(referencias)}]: {ref}")
+            arquivos = []
+            log_queue.put(f"Exportando {len(selecionadas)} referência(s)...")
+            for i, ref in enumerate(selecionadas):
+                log_queue.put(f"  [{i+1}/{len(selecionadas)}] {ref}")
                 try:
                     caminho = exportar_csv(page, ref, usuario)
                     if caminho:
-                        arquivos_exportados.append(caminho)
+                        arquivos.append(caminho)
                         log_queue.put(f"  Salvo: {os.path.basename(caminho)}")
                     time.sleep(2)
                 except Exception as e:
-                    log_queue.put(f"  ERRO: {e}")
+                    log_queue.put(f"  Erro em {ref}: {e}")
 
-            if browser:
-                browser.close()
-            else:
-                context.close()
+            browser.close()
 
-        if arquivos_exportados:
-            log_queue.put("Consolidando arquivos em Excel...")
-            excel = consolidar_excel(arquivos_exportados, usuario)
-            arquivos_exportados.append(excel)
-            log_queue.put(f"Excel gerado: {os.path.basename(excel)}")
+        if arquivos:
+            log_queue.put("Consolidando em Excel...")
+            excel = consolidar_excel(arquivos, usuario)
+            arquivos.append(excel)
+
+        log_queue.put(("CONCLUIDO", arquivos))
 
     except Exception as e:
         import traceback
-        log_queue.put(f"ERRO GERAL: {e}")
+        log_queue.put(f"Erro: {e}")
         log_queue.put(traceback.format_exc())
-    finally:
-        if xvfb_proc:
-            try:
-                xvfb_proc.terminate()
-            except Exception:
-                pass
+        log_queue.put(("ERRO", str(e)))
 
-    log_queue.put(("CONCLUIDO", arquivos_exportados))
+
+# ─── CONSTANTES ACOMPANHAMENTO ────────────────────────────────────
+
+CREDENCIADOS = [
+    "018375 - Instituto de Psiquiatria DF Ltda.",
+    "010357 - Comenth Assistência e Consultoria em Saude Ltda.",
+    "013520 - Mind Clínica Médica Ltda. Me",
+]
+
+URL_AMHPTISS_LOGIN = "https://amhptiss.amhp.com.br/"
+URL_ACOMPANHAMENTO = "https://amhptiss.amhp.com.br/AcompanhamentoAtendimentoDigital.aspx"
+
+
+# ─── ACOMPANHAMENTO ENVIOS DIGITAIS ───────────────────────────────
+
+def login_amhptiss_direto(page, usuario, senha, log_queue):
+    log_queue.put("Acessando portal AMHPTISS...")
+    page.goto(URL_AMHPTISS_LOGIN)
+    page.wait_for_load_state("networkidle")
+    page.fill("#ctl00_MainContent_txtLogin", usuario)
+    page.fill("#ctl00_MainContent_txtSenha", senha)
+    page.keyboard.press("Return")
+    page.wait_for_load_state("networkidle")
+    return "Default.aspx" in page.url
+
+
+def buscar_acompanhamento(page, data_ini, data_fim, credenciado, log_queue):
+    log_queue.put("Navegando para a página de envios digitais...")
+    page.goto(URL_ACOMPANHAMENTO)
+    page.wait_for_selector("#ctl00_MainContent_rdpDataInicio_dateInput", timeout=20000)
+
+    log_queue.put("Preenchendo filtros...")
+    campo_ini = page.locator("#ctl00_MainContent_rdpDataInicio_dateInput")
+    campo_ini.click()
+    campo_ini.press("Control+a")
+    campo_ini.type(data_ini)
+    campo_ini.press("Tab")
+
+    campo_fim = page.locator("#ctl00_MainContent_rdpDataFim_dateInput")
+    campo_fim.click()
+    campo_fim.press("Control+a")
+    campo_fim.type(data_fim)
+    campo_fim.press("Tab")
+
+    cred_input = page.locator("#ctl00_MainContent_rcbCredenciado_Input")
+    cred_input.click()
+    cred_input.press("Control+a")
+    cred_input.type(credenciado[:10])
+    page.wait_for_selector(
+        "#ctl00_MainContent_rcbCredenciado_DropDown .rcbList li",
+        timeout=10000,
+    )
+    page.wait_for_timeout(500)
+    itens = page.locator("#ctl00_MainContent_rcbCredenciado_DropDown .rcbList li")
+    for i in range(itens.count()):
+        if credenciado in (itens.nth(i).text_content() or ""):
+            itens.nth(i).click()
+            break
+    page.wait_for_timeout(500)
+
+    log_queue.put("Executando busca...")
+    page.locator("#ctl00_MainContent_btnBuscarAtendimentos_input").click()
+    try:
+        page.wait_for_selector(".raDiv", state="hidden", timeout=30000)
+    except Exception:
+        pass
+    page.wait_for_timeout(2000)
+
+    log_queue.put("Extraindo dados da tabela...")
+    linhas = page.locator(
+        "#ctl00_MainContent_rdgAcompanhamentoDigital table.rgMasterTable tr"
+    ).all()
+    dados = []
+    for linha in linhas:
+        celulas = linha.locator("th, td").all()
+        row = [c.text_content().strip() for c in celulas]
+        if any(row):
+            dados.append(row)
+    return dados
+
+
+def acompanhamento_thread(usuario, senha, data_ini, data_fim, credenciado, log_queue):
+    try:
+        with sync_playwright() as p:
+            browser = _criar_browser(p)
+            page = _criar_context(browser).new_page()
+
+            ok = login_amhptiss_direto(page, usuario, senha, log_queue)
+            if not ok:
+                raise Exception("Login AMHPTISS falhou. Verifique usuário e senha.")
+
+            log_queue.put("Login realizado!")
+            dados = buscar_acompanhamento(page, data_ini, data_fim, credenciado, log_queue)
+            browser.close()
+
+        if not dados:
+            raise Exception("Nenhum dado encontrado na tabela.")
+
+        os.makedirs(PASTA_DESTINO, exist_ok=True)
+        credenciado_slug = credenciado[:6].strip().replace(" ", "_")
+        nome_arq = os.path.join(
+            PASTA_DESTINO,
+            f"Acompanhamento_{credenciado_slug}_{data_ini.replace('/', '')}_{data_fim.replace('/', '')}.xlsx",
+        )
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Envios Digitais"
+        for row in dados:
+            ws.append(row)
+        for col in ws.columns:
+            max_len = max((len(str(cell.value)) for cell in col if cell.value), default=10)
+            ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 50)
+        wb.save(nome_arq)
+
+        log_queue.put(("CONCLUIDO_ACOMP", nome_arq, len(dados) - 1))
+
+    except Exception as e:
+        import traceback
+        log_queue.put(f"Erro: {e}")
+        log_queue.put(traceback.format_exc())
+        log_queue.put(("ERRO_ACOMP", str(e)))
 
 
 # ─── INTERFACE STREAMLIT ──────────────────────────────────────────
 
 st.set_page_config(page_title="Exportar Extrato AMHP", page_icon="📊", layout="centered")
-st.title("Exportar Extrato AMHP")
 
-with st.expander("Como obter os cookies? (necessario quando o login automatico e bloqueado)", expanded=False):
-    st.markdown("""
-1. Instale a extensao **Cookie-Editor** no seu navegador:
-   - [Chrome](https://chrome.google.com/webstore/detail/cookie-editor/hlkenndednhfkekhgcdicdfddnkalmdm)
-   - [Firefox](https://addons.mozilla.org/firefox/addon/cookie-editor/)
-2. Acesse **portal.amhp.com.br** e faca login com seu CNPJ e senha
-3. Clique no icone da extensao Cookie-Editor
-4. Clique em **Export > Export as JSON**
-5. Copie o conteudo e cole no campo 'Cookies' abaixo
-""")
+st.markdown("""
+<style>
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
 
-api_key_salva = carregar_anticaptcha_key()
-api_key_via_env = bool(os.environ.get("ANTICAPTCHA_KEY", ""))
+    .block-container {
+        padding-top: 1.5rem;
+        padding-bottom: 1rem;
+        max-width: 520px;
+    }
 
-with st.form("login_form"):
-    usuario  = st.text_input("CPF/CNPJ")
-    senha    = st.text_input("Senha", type="password")
-    qtd      = st.number_input("Quantos extratos recentes?", min_value=1, max_value=50, value=1, step=1)
-    if api_key_via_env:
-        st.info("Chave 2captcha carregada via variavel de ambiente.")
-        api_key = api_key_salva
-    else:
-        api_key  = st.text_input(
-            "Chave API 2captcha (opcional)",
-            value=api_key_salva,
-            type="password",
-            help="Crie uma conta em 2captcha.com, deposite credito e cole sua API key aqui. Sera salva automaticamente."
+    [data-testid="stForm"] {
+        background: #FFFFFF;
+        border-radius: 12px;
+        padding: 1.5rem 2rem 1rem 2rem;
+        box-shadow: 0 2px 16px rgba(14, 31, 59, 0.10);
+        border: 1px solid #c5d8ea;
+    }
+
+    .stButton > button {
+        background-color: #0E1F3B !important;
+        color: #FFFFFF !important;
+        border: none !important;
+        border-radius: 8px !important;
+        font-weight: 600 !important;
+        font-size: 1rem !important;
+        transition: background 0.2s !important;
+    }
+
+    .stButton > button:hover {
+        background-color: #4A90C4 !important;
+    }
+
+    .stTextInput > div > div > input {
+        border-radius: 6px !important;
+        border: 1.5px solid #c5d8ea !important;
+    }
+
+    [data-testid="stCodeBlock"] pre {
+        background-color: #0E1F3B !important;
+        color: #D6E4F0 !important;
+        border-radius: 8px !important;
+        font-size: 0.82rem !important;
+    }
+
+    .dev-footer {
+        text-align: center;
+        margin-top: 2.5rem;
+        padding-top: 1rem;
+        border-top: 1px solid #c5d8ea;
+        color: #666;
+        font-size: 0.78rem;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Logo AMHP
+if os.path.exists("amhplogo.png"):
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.image("amhplogo.png", use_container_width=True)
+    st.markdown("<br>", unsafe_allow_html=True)
+else:
+    st.title("Exportar Extrato AMHP")
+
+api_key = carregar_api_key()
+
+# Inicializa session_state
+for _k, _v in [
+    ("step", "input"), ("referencias", []), ("usuario", ""), ("senha", ""),
+    ("selecionadas", []), ("arquivos_finais", []),
+    ("acomp_step", "input"), ("acomp_arquivo", None), ("acomp_total", 0),
+    ("relatorio", "quitacoes"),
+]:
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
+
+extrato_em_progresso = st.session_state.step != "input"
+acomp_em_progresso   = st.session_state.acomp_step != "input"
+
+# ──────────────────────────────────────────────────────────────────
+# Fluxo: Relatório de Quitações
+# ──────────────────────────────────────────────────────────────────
+if extrato_em_progresso:
+
+    # ── Etapa 2: aguardando referências ──────────────────────────
+    if st.session_state.step == "buscando":
+        log_queue  = st.session_state.log_queue
+        thread     = st.session_state.browser_thread
+        ESTIMATIVA = 55
+
+        st.markdown("**Buscando referências disponíveis...**")
+        progress_bar       = st.progress(0.0)
+        col_timer, col_est = st.columns([1, 3])
+        timer_ph           = col_timer.empty()
+        col_est.caption(f"Tempo estimado: ~{ESTIMATIVA}s")
+        status_ph          = st.empty()
+        logs, refs, erro   = [], None, None
+        start_time         = time.time()
+
+        while refs is None and erro is None:
+            elapsed  = time.time() - start_time
+            progress_bar.progress(min(elapsed / ESTIMATIVA, 0.95))
+            timer_ph.metric("⏱", f"{int(elapsed)}s")
+
+            while not log_queue.empty():
+                item = log_queue.get_nowait()
+                if isinstance(item, tuple) and item[0] == "REFERENCIAS":
+                    refs = item[1]
+                elif isinstance(item, tuple) and item[0] == "ERRO":
+                    erro = item[1]
+                else:
+                    logs.append(str(item))
+                    status_ph.info(logs[-1])
+
+            if refs is None and erro is None:
+                if not thread.is_alive():
+                    erro = "Sessão encerrada inesperadamente."
+                    break
+                time.sleep(0.2)
+
+        if refs is not None:
+            progress_bar.progress(1.0)
+
+        if erro:
+            st.session_state.cmd_queue.put(None)
+            st.session_state.erro = erro
+            st.session_state.step = "input"
+        else:
+            st.session_state.referencias = refs
+            st.session_state.step = "select"
+        st.rerun()
+
+    # ── Etapa 3: seleção de referências ──────────────────────────
+    elif st.session_state.step == "select":
+        st.markdown(f"**{len(st.session_state.referencias)} referência(s) disponível(is)**")
+
+        selecionadas = st.multiselect(
+            "Selecione as referências para exportar:",
+            options=st.session_state.referencias,
+            default=st.session_state.referencias[:1] if st.session_state.referencias else [],
         )
-    cookies_input = st.text_area(
-        "Cookies (JSON) — necessario quando o login automatico e bloqueado",
-        height=120,
-        placeholder='Cole aqui o JSON exportado pelo Cookie-Editor. Ex: [{"name":"SESSION","value":"abc...",...}]',
-        help="Exporte os cookies apos fazer login manual em portal.amhp.com.br usando a extensao Cookie-Editor."
-    )
-    iniciar  = st.form_submit_button("Exportar", use_container_width=True)
 
-if iniciar:
-    if not usuario or not senha:
-        st.error("Preencha CPF/CNPJ e Senha.")
-    else:
-        api_key_final = api_key.strip()
-        if api_key_final:
-            salvar_anticaptcha_key(api_key_final)
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("← Voltar", use_container_width=True):
+                st.session_state.cmd_queue.put(None)
+                st.session_state.step = "input"
+                st.rerun()
+        with col2:
+            exportar = st.button("Exportar Selecionados →", use_container_width=True)
 
-        log_queue = queue.Queue()
-        thread = threading.Thread(
-            target=rodar_exportacao,
-            args=(usuario, senha, int(qtd), cookies_input.strip(), api_key_final, log_queue),
-            daemon=True
-        )
-        thread.start()
+        if exportar:
+            if not selecionadas:
+                st.error("Selecione ao menos uma referência.")
+            else:
+                st.session_state.selecionadas = selecionadas
+                st.session_state.cmd_queue.put(selecionadas)
+                st.session_state.step = "exportando"
+                st.rerun()
 
-        st.subheader("Progresso")
-        log_placeholder = st.empty()
-        logs = []
-        arquivos_finais = []
+    # ── Etapa 4: exportando ───────────────────────────────────────
+    elif st.session_state.step == "exportando":
+        log_queue  = st.session_state.log_queue
+        thread     = st.session_state.browser_thread
+        total_refs = len(st.session_state.selecionadas)
+
+        st.markdown(f"**Exportando {total_refs} referência(s)...**")
+        progress_bar  = st.progress(0.0)
+        timer_ph      = st.empty()
+        log_ph        = st.empty()
+        logs, arquivos_finais, erro = [], [], None
+        start_time    = time.time()
+        current_ref   = 0
 
         while thread.is_alive() or not log_queue.empty():
+            elapsed = time.time() - start_time
+            timer_ph.caption(f"⏱ {int(elapsed)}s")
+
             while not log_queue.empty():
                 item = log_queue.get_nowait()
                 if isinstance(item, tuple) and item[0] == "CONCLUIDO":
                     arquivos_finais = item[1]
+                elif isinstance(item, tuple) and item[0] == "ERRO":
+                    erro = item[1]
                 else:
-                    logs.append(item)
-                    log_placeholder.code("\n".join(logs))
+                    msg = str(item)
+                    m = re.search(r'\[(\d+)/\d+\]', msg)
+                    if m:
+                        current_ref = int(m.group(1))
+                        progress_bar.progress((current_ref - 0.5) / total_refs)
+                    logs.append(msg)
+                    log_ph.code("\n".join(logs))
             time.sleep(0.2)
 
+        progress_bar.progress(1.0)
+        st.session_state.arquivos_finais = arquivos_finais
+        if erro:
+            st.session_state.erro = erro
+        st.session_state.step = "done"
+        st.rerun()
+
+    # ── Etapa 5: download ─────────────────────────────────────────
+    elif st.session_state.step == "done":
+        if st.session_state.get("erro"):
+            st.error(st.session_state.pop("erro"))
+
+        arquivos_finais = st.session_state.arquivos_finais
         csvs  = [f for f in arquivos_finais if f.endswith(".csv")]
         excel = next((f for f in arquivos_finais if f.endswith(".xlsx")), None)
 
         if arquivos_finais:
-            st.success(f"Concluido! {len(csvs)} CSV(s) exportado(s).")
+            st.success(f"Concluído! {len(csvs)} arquivo(s) exportado(s).")
             st.subheader("Baixar arquivos")
             for arq in csvs:
                 with open(arq, "rb") as f:
@@ -765,7 +712,7 @@ if iniciar:
                         label=f"Baixar {os.path.basename(arq)}",
                         data=f.read(),
                         file_name=os.path.basename(arq),
-                        mime="text/csv"
+                        mime="text/csv",
                     )
             if excel and os.path.exists(excel):
                 with open(excel, "rb") as f:
@@ -773,12 +720,183 @@ if iniciar:
                         label=f"Baixar {os.path.basename(excel)} (consolidado)",
                         data=f.read(),
                         file_name=os.path.basename(excel),
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     )
         else:
-            st.error("Nenhum arquivo foi exportado. Verifique o log acima.")
-            screenshot_path = "/tmp/amhp_debug.png"
-            if os.path.exists(screenshot_path):
-                st.subheader("Screenshot da pagina no momento da falha")
-                with open(screenshot_path, "rb") as f:
-                    st.image(f.read(), caption="Estado da pagina ao falhar o login")
+            st.warning("Nenhum arquivo exportado. Verifique suas credenciais e tente novamente.")
+            if os.path.exists("/tmp/amhp_debug.png"):
+                with open("/tmp/amhp_debug.png", "rb") as f:
+                    st.image(f.read(), caption="Estado da página ao falhar")
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("Nova Exportação", use_container_width=True):
+            for _k in ["step", "referencias", "usuario", "senha", "selecionadas",
+                       "arquivos_finais", "log_queue", "cmd_queue", "browser_thread"]:
+                st.session_state.pop(_k, None)
+            st.rerun()
+
+# ──────────────────────────────────────────────────────────────────
+# Fluxo: Acompanhamento de Envios Digitais
+# ──────────────────────────────────────────────────────────────────
+elif acomp_em_progresso:
+
+    # ── Etapa 2: processando ──────────────────────────────────────
+    if st.session_state.acomp_step == "processando":
+        log_queue  = st.session_state.acomp_log_queue
+        thread     = st.session_state.acomp_thread
+        ESTIMATIVA = 40
+
+        st.markdown("**Buscando atendimentos...**")
+        progress_bar       = st.progress(0.0)
+        col_timer, col_est = st.columns([1, 3])
+        timer_ph           = col_timer.empty()
+        col_est.caption(f"Tempo estimado: ~{ESTIMATIVA}s")
+        log_ph             = st.empty()
+        logs, resultado, erro = [], None, None
+        start_time         = time.time()
+
+        while resultado is None and erro is None:
+            elapsed = time.time() - start_time
+            progress_bar.progress(min(elapsed / ESTIMATIVA, 0.95))
+            timer_ph.metric("⏱", f"{int(elapsed)}s")
+
+            while not log_queue.empty():
+                item = log_queue.get_nowait()
+                if isinstance(item, tuple) and item[0] == "CONCLUIDO_ACOMP":
+                    resultado = item
+                elif isinstance(item, tuple) and item[0] == "ERRO_ACOMP":
+                    erro = item[1]
+                else:
+                    logs.append(str(item))
+                    log_ph.info(logs[-1])
+
+            if resultado is None and erro is None:
+                if not thread.is_alive():
+                    erro = "Processo encerrado inesperadamente."
+                    break
+                time.sleep(0.2)
+
+        progress_bar.progress(1.0)
+
+        if erro:
+            st.session_state.acomp_erro = erro
+            st.session_state.acomp_step = "input"
+        else:
+            _, nome_arq, total = resultado
+            st.session_state.acomp_arquivo = nome_arq
+            st.session_state.acomp_total   = total
+            st.session_state.acomp_step    = "done"
+        st.rerun()
+
+    # ── Etapa 3: download ─────────────────────────────────────────
+    elif st.session_state.acomp_step == "done":
+        nome_arq = st.session_state.acomp_arquivo
+        total    = st.session_state.acomp_total
+
+        st.success(f"Concluído! {total} linha(s) encontrada(s).")
+        if nome_arq and os.path.exists(nome_arq):
+            with open(nome_arq, "rb") as f:
+                st.download_button(
+                    label=f"Baixar {os.path.basename(nome_arq)}",
+                    data=f.read(),
+                    file_name=os.path.basename(nome_arq),
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("Nova Busca", use_container_width=True):
+            for _k in ["acomp_step", "acomp_arquivo", "acomp_total",
+                       "acomp_log_queue", "acomp_thread"]:
+                st.session_state.pop(_k, None)
+            st.rerun()
+
+# ──────────────────────────────────────────────────────────────────
+# Tela inicial: seletor + formulário
+# ──────────────────────────────────────────────────────────────────
+else:
+    st.radio(
+        "Selecione o relatório:",
+        options=["quitacoes", "acompanhamento"],
+        format_func=lambda x: "📄 Relatório de Quitações" if x == "quitacoes" else "📋 Acompanhamento de Envios Digitais",
+        key="relatorio",
+        horizontal=True,
+    )
+    st.markdown("---")
+
+    # ── Formulário: Relatório de Quitações ───────────────────────
+    if st.session_state.relatorio == "quitacoes":
+        if st.session_state.get("erro"):
+            st.error(st.session_state.pop("erro"))
+
+        if not api_key:
+            st.error("Chave 2captcha nao configurada. Defina a variavel de ambiente ANTICAPTCHA_KEY.")
+        else:
+            with st.form("credentials_form"):
+                usuario = st.text_input("CPF/CNPJ")
+                senha   = st.text_input("Senha", type="password")
+                buscar  = st.form_submit_button("Buscar Referências", use_container_width=True)
+
+            if buscar:
+                if not usuario or not senha:
+                    st.error("Preencha CPF/CNPJ e Senha.")
+                else:
+                    st.session_state.usuario   = usuario
+                    st.session_state.senha     = senha
+                    st.session_state.log_queue = queue.Queue()
+                    st.session_state.cmd_queue = queue.Queue()
+                    t = threading.Thread(
+                        target=sessao_unica_thread,
+                        args=(usuario, senha, api_key,
+                              st.session_state.log_queue, st.session_state.cmd_queue),
+                        daemon=True,
+                    )
+                    t.start()
+                    st.session_state.browser_thread = t
+                    st.session_state.step = "buscando"
+                    st.rerun()
+
+    # ── Formulário: Acompanhamento de Envios Digitais ─────────────
+    else:
+        if st.session_state.get("acomp_erro"):
+            st.error(st.session_state.pop("acomp_erro"))
+
+        with st.form("acomp_form"):
+            acomp_usuario    = st.text_input("Usuário (login AMHPTISS)")
+            acomp_senha      = st.text_input("Senha", type="password")
+            col_ini, col_fim = st.columns(2)
+            with col_ini:
+                acomp_data_ini = st.text_input("Data Início (dd/MM/yyyy)")
+            with col_fim:
+                acomp_data_fim = st.text_input("Data Fim (dd/MM/yyyy)")
+            acomp_credenciado = st.selectbox("Credenciado", CREDENCIADOS)
+            acomp_buscar = st.form_submit_button("Buscar Atendimentos", use_container_width=True)
+
+        if acomp_buscar:
+            if not acomp_usuario or not acomp_senha or not acomp_data_ini or not acomp_data_fim:
+                st.error("Preencha todos os campos.")
+            else:
+                st.session_state.acomp_log_queue = queue.Queue()
+                t = threading.Thread(
+                    target=acompanhamento_thread,
+                    args=(acomp_usuario, acomp_senha, acomp_data_ini, acomp_data_fim,
+                          acomp_credenciado, st.session_state.acomp_log_queue),
+                    daemon=True,
+                )
+                t.start()
+                st.session_state.acomp_thread = t
+                st.session_state.acomp_step = "processando"
+                st.rerun()
+
+# ── Rodapé ────────────────────────────────────────────────────────
+if os.path.exists("logo_b4strategy.png"):
+    with open("logo_b4strategy.png", "rb") as f:
+        logo_b64 = base64.b64encode(f.read()).decode()
+    st.markdown(f"""
+<div class="dev-footer">
+    Desenvolvido por<br>
+    <img src="data:image/png;base64,{logo_b64}" height="32" style="margin-top:6px; opacity:0.85;"><br>
+    <a href="mailto:contato@b4strategy.com.br" style="color:#4A90C4; text-decoration:none; font-size:0.75rem;">
+        contato@b4strategy.com.br
+    </a>
+</div>
+""", unsafe_allow_html=True)
