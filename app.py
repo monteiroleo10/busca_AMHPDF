@@ -416,20 +416,16 @@ def buscar_acompanhamento(page, data_ini, data_fim, credenciado, log_queue):
     campo_fim.type(data_fim)
     campo_fim.press("Tab")
 
+    # Abre o dropdown e clica diretamente no item pelo código único
+    codigo = credenciado.split(" - ")[0].strip()
     cred_input = page.locator("#ctl00_MainContent_rcbCredenciado_Input")
     cred_input.click()
-    cred_input.press("Control+a")
-    cred_input.type(credenciado[:10])
     page.wait_for_selector(
         "#ctl00_MainContent_rcbCredenciado_DropDown .rcbList li",
         timeout=10000,
     )
     page.wait_for_timeout(500)
-    itens = page.locator("#ctl00_MainContent_rcbCredenciado_DropDown .rcbList li")
-    for i in range(itens.count()):
-        if credenciado in (itens.nth(i).text_content() or ""):
-            itens.nth(i).click()
-            break
+    page.locator(f"#ctl00_MainContent_rcbCredenciado_DropDown .rcbList li:has-text('{codigo}')").click()
     page.wait_for_timeout(500)
 
     log_queue.put("Executando busca...")
@@ -816,9 +812,9 @@ elif acomp_em_progresso:
         with st.form("acomp_filtros_form"):
             col_ini, col_fim = st.columns(2)
             with col_ini:
-                data_ini = st.text_input("Data Início (dd/MM/yyyy)")
+                data_ini_dt = st.date_input("Data Início", format="DD/MM/YYYY")
             with col_fim:
-                data_fim = st.text_input("Data Fim (dd/MM/yyyy)")
+                data_fim_dt = st.date_input("Data Fim", format="DD/MM/YYYY")
             credenciado = st.selectbox("Credenciado", credenciados)
             buscar = st.form_submit_button("Buscar Atendimentos", use_container_width=True)
 
@@ -828,10 +824,9 @@ elif acomp_em_progresso:
             st.rerun()
 
         if buscar:
-            if not data_ini or not data_fim:
-                st.error("Preencha as datas.")
-            else:
-                st.session_state.acomp_cmd_queue.put((data_ini, data_fim, credenciado))
+            data_ini = data_ini_dt.strftime("%d/%m/%Y")
+            data_fim = data_fim_dt.strftime("%d/%m/%Y")
+            st.session_state.acomp_cmd_queue.put((data_ini, data_fim, credenciado))
                 st.session_state.acomp_step = "processando"
                 st.rerun()
 
@@ -928,7 +923,7 @@ else:
             with st.form("credentials_form"):
                 usuario = st.text_input("CPF/CNPJ")
                 senha   = st.text_input("Senha", type="password")
-                buscar  = st.form_submit_button("Buscar Referências", use_container_width=True)
+                buscar  = st.form_submit_button("Entrar", use_container_width=True)
 
             if buscar:
                 if not usuario or not senha:
