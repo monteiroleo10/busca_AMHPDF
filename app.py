@@ -827,8 +827,8 @@ elif acomp_em_progresso:
             data_ini = data_ini_dt.strftime("%d/%m/%Y")
             data_fim = data_fim_dt.strftime("%d/%m/%Y")
             st.session_state.acomp_cmd_queue.put((data_ini, data_fim, credenciado))
-                st.session_state.acomp_step = "processando"
-                st.rerun()
+            st.session_state.acomp_step = "processando"
+            st.rerun()
 
     # ── Etapa 4: processando ──────────────────────────────────────
     elif st.session_state.acomp_step == "processando":
