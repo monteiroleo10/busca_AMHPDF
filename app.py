@@ -371,8 +371,17 @@ URL_ACOMPANHAMENTO = "https://amhptiss.amhp.com.br/AcompanhamentoAtendimentoDigi
 
 
 def obter_credenciados_acompanhamento(page):
+    # Estabelece sessão no amhptiss (mesmo SSO do extrato)
+    try:
+        page.wait_for_selector("text=AMHPTISS", timeout=8000)
+        page.get_by_text("AMHPTISS", exact=False).first.click()
+        page.wait_for_load_state("load")
+    except Exception:
+        pass
+
     page.goto(URL_ACOMPANHAMENTO)
-    page.wait_for_selector("#ctl00_MainContent_rcbCredenciado_Input", timeout=20000)
+    page.wait_for_load_state("domcontentloaded")
+    page.wait_for_selector("#ctl00_MainContent_rcbCredenciado_Input", timeout=30000)
     page.locator("#ctl00_MainContent_rcbCredenciado_Input").click()
     page.wait_for_selector(
         "#ctl00_MainContent_rcbCredenciado_DropDown .rcbList li",
@@ -900,15 +909,12 @@ elif acomp_em_progresso:
 # Tela inicial: seletor + formulário
 # ──────────────────────────────────────────────────────────────────
 else:
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("📄 Relatório de Quitações", use_container_width=True):
-            st.session_state.relatorio = "quitacoes"
-            st.rerun()
-    with col2:
-        if st.button("📋 Acompanhamento de Envios Digitais", use_container_width=True):
-            st.session_state.relatorio = "acompanhamento"
-            st.rerun()
+    st.selectbox(
+        "Selecione o relatório:",
+        options=["quitacoes", "acompanhamento"],
+        format_func=lambda x: "📄 Relatório de Quitações" if x == "quitacoes" else "📋 Acompanhamento de Envios Digitais",
+        key="relatorio",
+    )
     st.markdown("---")
 
     # ── Formulário: Relatório de Quitações ───────────────────────
