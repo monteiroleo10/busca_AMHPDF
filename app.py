@@ -12,6 +12,7 @@ import re
 import urllib.parse
 import base64
 import pandas as pd
+import openpyxl
 from playwright.sync_api import sync_playwright
 
 
@@ -362,6 +363,131 @@ def sessao_unica_thread(usuario, senha, api_key, log_queue, cmd_queue):
         log_queue.put(f"Erro: {e}")
         log_queue.put(traceback.format_exc())
         log_queue.put(("ERRO", str(e)))
+<<<<<<< HEAD
+
+
+# ─── CONSTANTES ACOMPANHAMENTO ────────────────────────────────────
+
+CREDENCIADOS = [
+    "018375 - Instituto de Psiquiatria DF Ltda.",
+    "010357 - Comenth Assistência e Consultoria em Saude Ltda.",
+    "013520 - Mind Clínica Médica Ltda. Me",
+]
+
+URL_AMHPTISS_LOGIN = "https://amhptiss.amhp.com.br/"
+URL_ACOMPANHAMENTO = "https://amhptiss.amhp.com.br/AcompanhamentoAtendimentoDigital.aspx"
+
+
+# ─── ACOMPANHAMENTO ENVIOS DIGITAIS ───────────────────────────────
+
+def login_amhptiss_direto(page, usuario, senha, log_queue):
+    log_queue.put("Acessando portal AMHPTISS...")
+    page.goto(URL_AMHPTISS_LOGIN)
+    page.wait_for_load_state("networkidle")
+    page.fill("#ctl00_MainContent_txtLogin", usuario)
+    page.fill("#ctl00_MainContent_txtSenha", senha)
+    page.keyboard.press("Return")
+    page.wait_for_load_state("networkidle")
+    return "Default.aspx" in page.url
+
+
+def buscar_acompanhamento(page, data_ini, data_fim, credenciado, log_queue):
+    log_queue.put("Navegando para a página de envios digitais...")
+    page.goto(URL_ACOMPANHAMENTO)
+    page.wait_for_selector("#ctl00_MainContent_rdpDataInicio_dateInput", timeout=20000)
+
+    log_queue.put("Preenchendo filtros...")
+    campo_ini = page.locator("#ctl00_MainContent_rdpDataInicio_dateInput")
+    campo_ini.click()
+    campo_ini.press("Control+a")
+    campo_ini.type(data_ini)
+    campo_ini.press("Tab")
+
+    campo_fim = page.locator("#ctl00_MainContent_rdpDataFim_dateInput")
+    campo_fim.click()
+    campo_fim.press("Control+a")
+    campo_fim.type(data_fim)
+    campo_fim.press("Tab")
+
+    cred_input = page.locator("#ctl00_MainContent_rcbCredenciado_Input")
+    cred_input.click()
+    cred_input.press("Control+a")
+    cred_input.type(credenciado[:10])
+    page.wait_for_selector(
+        "#ctl00_MainContent_rcbCredenciado_DropDown .rcbList li",
+        timeout=10000,
+    )
+    page.wait_for_timeout(500)
+    itens = page.locator("#ctl00_MainContent_rcbCredenciado_DropDown .rcbList li")
+    for i in range(itens.count()):
+        if credenciado in (itens.nth(i).text_content() or ""):
+            itens.nth(i).click()
+            break
+    page.wait_for_timeout(500)
+
+    log_queue.put("Executando busca...")
+    page.locator("#ctl00_MainContent_btnBuscarAtendimentos_input").click()
+    try:
+        page.wait_for_selector(".raDiv", state="hidden", timeout=30000)
+    except Exception:
+        pass
+    page.wait_for_timeout(2000)
+
+    log_queue.put("Extraindo dados da tabela...")
+    linhas = page.locator(
+        "#ctl00_MainContent_rdgAcompanhamentoDigital table.rgMasterTable tr"
+    ).all()
+    dados = []
+    for linha in linhas:
+        celulas = linha.locator("th, td").all()
+        row = [c.text_content().strip() for c in celulas]
+        if any(row):
+            dados.append(row)
+    return dados
+
+
+def acompanhamento_thread(usuario, senha, data_ini, data_fim, credenciado, log_queue):
+    try:
+        with sync_playwright() as p:
+            browser = _criar_browser(p)
+            page = _criar_context(browser).new_page()
+
+            ok = login_amhptiss_direto(page, usuario, senha, log_queue)
+            if not ok:
+                raise Exception("Login AMHPTISS falhou. Verifique usuário e senha.")
+
+            log_queue.put("Login realizado!")
+            dados = buscar_acompanhamento(page, data_ini, data_fim, credenciado, log_queue)
+            browser.close()
+
+        if not dados:
+            raise Exception("Nenhum dado encontrado na tabela.")
+
+        os.makedirs(PASTA_DESTINO, exist_ok=True)
+        credenciado_slug = credenciado[:6].strip().replace(" ", "_")
+        nome_arq = os.path.join(
+            PASTA_DESTINO,
+            f"Acompanhamento_{credenciado_slug}_{data_ini.replace('/', '')}_{data_fim.replace('/', '')}.xlsx",
+        )
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Envios Digitais"
+        for row in dados:
+            ws.append(row)
+        for col in ws.columns:
+            max_len = max((len(str(cell.value)) for cell in col if cell.value), default=10)
+            ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 50)
+        wb.save(nome_arq)
+
+        log_queue.put(("CONCLUIDO_ACOMP", nome_arq, len(dados) - 1))
+
+    except Exception as e:
+        import traceback
+        log_queue.put(f"Erro: {e}")
+        log_queue.put(traceback.format_exc())
+        log_queue.put(("ERRO_ACOMP", str(e)))
+=======
+>>>>>>> 23dc7072881b5f305cf5a201107fe40654c624a3
 
 
 # ─── INTERFACE STREAMLIT ──────────────────────────────────────────
@@ -387,6 +513,384 @@ st.markdown("""
         box-shadow: 0 2px 16px rgba(14, 31, 59, 0.10);
         border: 1px solid #c5d8ea;
     }
+<<<<<<< HEAD
+
+    .stButton > button {
+        background-color: #0E1F3B !important;
+        color: #FFFFFF !important;
+        border: none !important;
+        border-radius: 8px !important;
+        font-weight: 600 !important;
+        font-size: 1rem !important;
+        transition: background 0.2s !important;
+    }
+
+    .stButton > button:hover {
+        background-color: #4A90C4 !important;
+    }
+
+    .stTextInput > div > div > input {
+        border-radius: 6px !important;
+        border: 1.5px solid #c5d8ea !important;
+    }
+
+    [data-testid="stCodeBlock"] pre {
+        background-color: #0E1F3B !important;
+        color: #D6E4F0 !important;
+        border-radius: 8px !important;
+        font-size: 0.82rem !important;
+    }
+
+    .dev-footer {
+        text-align: center;
+        margin-top: 2.5rem;
+        padding-top: 1rem;
+        border-top: 1px solid #c5d8ea;
+        color: #666;
+        font-size: 0.78rem;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Logo AMHP
+if os.path.exists("amhplogo.png"):
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.image("amhplogo.png", use_container_width=True)
+    st.markdown("<br>", unsafe_allow_html=True)
+else:
+    st.title("Exportar Extrato AMHP")
+
+api_key = carregar_api_key()
+
+# Inicializa session_state
+for _k, _v in [
+    ("step", "input"), ("referencias", []), ("usuario", ""), ("senha", ""),
+    ("selecionadas", []), ("arquivos_finais", []),
+    ("acomp_step", "input"), ("acomp_arquivo", None), ("acomp_total", 0),
+    ("relatorio", "quitacoes"),
+]:
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
+
+extrato_em_progresso = st.session_state.step != "input"
+acomp_em_progresso   = st.session_state.acomp_step != "input"
+
+# ──────────────────────────────────────────────────────────────────
+# Fluxo: Relatório de Quitações
+# ──────────────────────────────────────────────────────────────────
+if extrato_em_progresso:
+
+    # ── Etapa 2: aguardando referências ──────────────────────────
+    if st.session_state.step == "buscando":
+        log_queue  = st.session_state.log_queue
+        thread     = st.session_state.browser_thread
+        ESTIMATIVA = 55
+
+        st.markdown("**Buscando referências disponíveis...**")
+        progress_bar       = st.progress(0.0)
+        col_timer, col_est = st.columns([1, 3])
+        timer_ph           = col_timer.empty()
+        col_est.caption(f"Tempo estimado: ~{ESTIMATIVA}s")
+        status_ph          = st.empty()
+        logs, refs, erro   = [], None, None
+        start_time         = time.time()
+
+        while refs is None and erro is None:
+            elapsed  = time.time() - start_time
+            progress_bar.progress(min(elapsed / ESTIMATIVA, 0.95))
+            timer_ph.metric("⏱", f"{int(elapsed)}s")
+
+            while not log_queue.empty():
+                item = log_queue.get_nowait()
+                if isinstance(item, tuple) and item[0] == "REFERENCIAS":
+                    refs = item[1]
+                elif isinstance(item, tuple) and item[0] == "ERRO":
+                    erro = item[1]
+                else:
+                    logs.append(str(item))
+                    status_ph.info(logs[-1])
+
+            if refs is None and erro is None:
+                if not thread.is_alive():
+                    erro = "Sessão encerrada inesperadamente."
+                    break
+                time.sleep(0.2)
+
+        if refs is not None:
+            progress_bar.progress(1.0)
+
+        if erro:
+            st.session_state.cmd_queue.put(None)
+            st.session_state.erro = erro
+            st.session_state.step = "input"
+        else:
+            st.session_state.referencias = refs
+            st.session_state.step = "select"
+        st.rerun()
+
+    # ── Etapa 3: seleção de referências ──────────────────────────
+    elif st.session_state.step == "select":
+        st.markdown(f"**{len(st.session_state.referencias)} referência(s) disponível(is)**")
+
+        selecionadas = st.multiselect(
+            "Selecione as referências para exportar:",
+            options=st.session_state.referencias,
+            default=st.session_state.referencias[:1] if st.session_state.referencias else [],
+        )
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("← Voltar", use_container_width=True):
+                st.session_state.cmd_queue.put(None)
+                st.session_state.step = "input"
+                st.rerun()
+        with col2:
+            exportar = st.button("Exportar Selecionados →", use_container_width=True)
+
+        if exportar:
+            if not selecionadas:
+                st.error("Selecione ao menos uma referência.")
+            else:
+                st.session_state.selecionadas = selecionadas
+                st.session_state.cmd_queue.put(selecionadas)
+                st.session_state.step = "exportando"
+                st.rerun()
+
+    # ── Etapa 4: exportando ───────────────────────────────────────
+    elif st.session_state.step == "exportando":
+        log_queue  = st.session_state.log_queue
+        thread     = st.session_state.browser_thread
+        total_refs = len(st.session_state.selecionadas)
+
+        st.markdown(f"**Exportando {total_refs} referência(s)...**")
+        progress_bar  = st.progress(0.0)
+        timer_ph      = st.empty()
+        log_ph        = st.empty()
+        logs, arquivos_finais, erro = [], [], None
+        start_time    = time.time()
+        current_ref   = 0
+
+        while thread.is_alive() or not log_queue.empty():
+            elapsed = time.time() - start_time
+            timer_ph.caption(f"⏱ {int(elapsed)}s")
+
+            while not log_queue.empty():
+                item = log_queue.get_nowait()
+                if isinstance(item, tuple) and item[0] == "CONCLUIDO":
+                    arquivos_finais = item[1]
+                elif isinstance(item, tuple) and item[0] == "ERRO":
+                    erro = item[1]
+                else:
+                    msg = str(item)
+                    m = re.search(r'\[(\d+)/\d+\]', msg)
+                    if m:
+                        current_ref = int(m.group(1))
+                        progress_bar.progress((current_ref - 0.5) / total_refs)
+                    logs.append(msg)
+                    log_ph.code("\n".join(logs))
+            time.sleep(0.2)
+
+        progress_bar.progress(1.0)
+        st.session_state.arquivos_finais = arquivos_finais
+        if erro:
+            st.session_state.erro = erro
+        st.session_state.step = "done"
+        st.rerun()
+
+    # ── Etapa 5: download ─────────────────────────────────────────
+    elif st.session_state.step == "done":
+        if st.session_state.get("erro"):
+            st.error(st.session_state.pop("erro"))
+
+        arquivos_finais = st.session_state.arquivos_finais
+        csvs  = [f for f in arquivos_finais if f.endswith(".csv")]
+        excel = next((f for f in arquivos_finais if f.endswith(".xlsx")), None)
+
+        if arquivos_finais:
+            st.success(f"Concluído! {len(csvs)} arquivo(s) exportado(s).")
+            st.subheader("Baixar arquivos")
+            for arq in csvs:
+                with open(arq, "rb") as f:
+                    st.download_button(
+                        label=f"Baixar {os.path.basename(arq)}",
+                        data=f.read(),
+                        file_name=os.path.basename(arq),
+                        mime="text/csv",
+                    )
+            if excel and os.path.exists(excel):
+                with open(excel, "rb") as f:
+                    st.download_button(
+                        label=f"Baixar {os.path.basename(excel)} (consolidado)",
+                        data=f.read(),
+                        file_name=os.path.basename(excel),
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+        else:
+            st.warning("Nenhum arquivo exportado. Verifique suas credenciais e tente novamente.")
+            if os.path.exists("/tmp/amhp_debug.png"):
+                with open("/tmp/amhp_debug.png", "rb") as f:
+                    st.image(f.read(), caption="Estado da página ao falhar")
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("Nova Exportação", use_container_width=True):
+            for _k in ["step", "referencias", "usuario", "senha", "selecionadas",
+                       "arquivos_finais", "log_queue", "cmd_queue", "browser_thread"]:
+                st.session_state.pop(_k, None)
+            st.rerun()
+
+# ──────────────────────────────────────────────────────────────────
+# Fluxo: Acompanhamento de Envios Digitais
+# ──────────────────────────────────────────────────────────────────
+elif acomp_em_progresso:
+
+    # ── Etapa 2: processando ──────────────────────────────────────
+    if st.session_state.acomp_step == "processando":
+        log_queue  = st.session_state.acomp_log_queue
+        thread     = st.session_state.acomp_thread
+        ESTIMATIVA = 40
+
+        st.markdown("**Buscando atendimentos...**")
+        progress_bar       = st.progress(0.0)
+        col_timer, col_est = st.columns([1, 3])
+        timer_ph           = col_timer.empty()
+        col_est.caption(f"Tempo estimado: ~{ESTIMATIVA}s")
+        log_ph             = st.empty()
+        logs, resultado, erro = [], None, None
+        start_time         = time.time()
+
+        while resultado is None and erro is None:
+            elapsed = time.time() - start_time
+            progress_bar.progress(min(elapsed / ESTIMATIVA, 0.95))
+            timer_ph.metric("⏱", f"{int(elapsed)}s")
+
+            while not log_queue.empty():
+                item = log_queue.get_nowait()
+                if isinstance(item, tuple) and item[0] == "CONCLUIDO_ACOMP":
+                    resultado = item
+                elif isinstance(item, tuple) and item[0] == "ERRO_ACOMP":
+                    erro = item[1]
+                else:
+                    logs.append(str(item))
+                    log_ph.info(logs[-1])
+
+            if resultado is None and erro is None:
+                if not thread.is_alive():
+                    erro = "Processo encerrado inesperadamente."
+                    break
+                time.sleep(0.2)
+
+        progress_bar.progress(1.0)
+
+        if erro:
+            st.session_state.acomp_erro = erro
+            st.session_state.acomp_step = "input"
+        else:
+            _, nome_arq, total = resultado
+            st.session_state.acomp_arquivo = nome_arq
+            st.session_state.acomp_total   = total
+            st.session_state.acomp_step    = "done"
+        st.rerun()
+
+    # ── Etapa 3: download ─────────────────────────────────────────
+    elif st.session_state.acomp_step == "done":
+        nome_arq = st.session_state.acomp_arquivo
+        total    = st.session_state.acomp_total
+
+        st.success(f"Concluído! {total} linha(s) encontrada(s).")
+        if nome_arq and os.path.exists(nome_arq):
+            with open(nome_arq, "rb") as f:
+                st.download_button(
+                    label=f"Baixar {os.path.basename(nome_arq)}",
+                    data=f.read(),
+                    file_name=os.path.basename(nome_arq),
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("Nova Busca", use_container_width=True):
+            for _k in ["acomp_step", "acomp_arquivo", "acomp_total",
+                       "acomp_log_queue", "acomp_thread"]:
+                st.session_state.pop(_k, None)
+            st.rerun()
+
+# ──────────────────────────────────────────────────────────────────
+# Tela inicial: seletor + formulário
+# ──────────────────────────────────────────────────────────────────
+else:
+    st.radio(
+        "Selecione o relatório:",
+        options=["quitacoes", "acompanhamento"],
+        format_func=lambda x: "📄 Relatório de Quitações" if x == "quitacoes" else "📋 Acompanhamento de Envios Digitais",
+        key="relatorio",
+        horizontal=True,
+    )
+    st.markdown("---")
+
+    # ── Formulário: Relatório de Quitações ───────────────────────
+    if st.session_state.relatorio == "quitacoes":
+        if st.session_state.get("erro"):
+            st.error(st.session_state.pop("erro"))
+
+        if not api_key:
+            st.error("Chave 2captcha nao configurada. Defina a variavel de ambiente ANTICAPTCHA_KEY.")
+        else:
+            with st.form("credentials_form"):
+                usuario = st.text_input("CPF/CNPJ")
+                senha   = st.text_input("Senha", type="password")
+                buscar  = st.form_submit_button("Buscar Referências", use_container_width=True)
+
+            if buscar:
+                if not usuario or not senha:
+                    st.error("Preencha CPF/CNPJ e Senha.")
+                else:
+                    st.session_state.usuario   = usuario
+                    st.session_state.senha     = senha
+                    st.session_state.log_queue = queue.Queue()
+                    st.session_state.cmd_queue = queue.Queue()
+                    t = threading.Thread(
+                        target=sessao_unica_thread,
+                        args=(usuario, senha, api_key,
+                              st.session_state.log_queue, st.session_state.cmd_queue),
+                        daemon=True,
+                    )
+                    t.start()
+                    st.session_state.browser_thread = t
+                    st.session_state.step = "buscando"
+                    st.rerun()
+
+    # ── Formulário: Acompanhamento de Envios Digitais ─────────────
+    else:
+        if st.session_state.get("acomp_erro"):
+            st.error(st.session_state.pop("acomp_erro"))
+
+        with st.form("acomp_form"):
+            acomp_usuario    = st.text_input("Usuário (login AMHPTISS)")
+            acomp_senha      = st.text_input("Senha", type="password")
+            col_ini, col_fim = st.columns(2)
+            with col_ini:
+                acomp_data_ini = st.text_input("Data Início (dd/MM/yyyy)")
+            with col_fim:
+                acomp_data_fim = st.text_input("Data Fim (dd/MM/yyyy)")
+            acomp_credenciado = st.selectbox("Credenciado", CREDENCIADOS)
+            acomp_buscar = st.form_submit_button("Buscar Atendimentos", use_container_width=True)
+
+        if acomp_buscar:
+            if not acomp_usuario or not acomp_senha or not acomp_data_ini or not acomp_data_fim:
+                st.error("Preencha todos os campos.")
+            else:
+                st.session_state.acomp_log_queue = queue.Queue()
+                t = threading.Thread(
+                    target=acompanhamento_thread,
+                    args=(acomp_usuario, acomp_senha, acomp_data_ini, acomp_data_fim,
+                          acomp_credenciado, st.session_state.acomp_log_queue),
+                    daemon=True,
+                )
+                t.start()
+                st.session_state.acomp_thread = t
+                st.session_state.acomp_step = "processando"
+                st.rerun()
+=======
 
     .stButton > button {
         background-color: #0E1F3B !important;
@@ -632,6 +1136,7 @@ elif st.session_state.step == "done":
                    "arquivos_finais", "log_queue", "cmd_queue", "browser_thread"]:
             st.session_state.pop(_k, None)
         st.rerun()
+>>>>>>> 23dc7072881b5f305cf5a201107fe40654c624a3
 
 # ── Rodapé ────────────────────────────────────────────────────────
 if os.path.exists("logo_b4strategy.png"):
