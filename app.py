@@ -489,6 +489,14 @@ def acompanhamento_thread(usuario, senha, api_key, log_queue, cmd_queue):
         ws.title = "Envios Digitais"
         for row in dados:
             ws.append(row)
+        # Converte coluna J (índice 9) para número a partir da linha 2
+        for row in ws.iter_rows(min_row=2, min_col=10, max_col=10):
+            for cell in row:
+                if cell.value:
+                    try:
+                        cell.value = float(str(cell.value).replace(",", ".").replace(" ", ""))
+                    except (ValueError, TypeError):
+                        pass
         for col in ws.columns:
             max_len = max((len(str(cell.value)) for cell in col if cell.value), default=10)
             ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 50)
@@ -569,9 +577,15 @@ if os.path.exists("amhplogo.png"):
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
         st.image("amhplogo.png", use_container_width=True)
-    st.markdown("<br>", unsafe_allow_html=True)
 else:
     st.title("Exportar Extrato AMHP")
+
+st.markdown(
+    "<p style='text-align:center; color:#4A7FA5; font-size:0.95rem; margin-top:0.25rem; margin-bottom:1.25rem;'>"
+    "Acompanhe os envios e baixas de faturamento da AMHPDF em um só lugar."
+    "</p>",
+    unsafe_allow_html=True,
+)
 
 api_key = carregar_api_key()
 
@@ -722,6 +736,7 @@ if extrato_em_progresso:
 
         if arquivos_finais:
             st.success(f"Concluído! {len(csvs)} arquivo(s) exportado(s).")
+            st.info("Obrigado por utilizar nosso sistema! — Equipe B4")
             st.subheader("Baixar arquivos")
             for arq in csvs:
                 with open(arq, "rb") as f:
@@ -884,6 +899,7 @@ elif acomp_em_progresso:
         total    = st.session_state.acomp_total
 
         st.success(f"Concluído! {total} linha(s) encontrada(s).")
+        st.info("Obrigado por usar o sistema AMHPDF. Bom trabalho!")
         if nome_arq and os.path.exists(nome_arq):
             with open(nome_arq, "rb") as f:
                 st.download_button(
