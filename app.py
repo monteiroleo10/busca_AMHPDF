@@ -433,14 +433,10 @@ def buscar_acompanhamento(page, data_ini, data_fim, credenciado, log_queue):
         page.wait_for_selector(".raDiv", state="hidden", timeout=30000)
     except Exception:
         pass
-    # Espera a tabela renderizar (substitui pausa fixa de 2s).
-    try:
-        page.wait_for_selector(
-            "#ctl00_MainContent_rdgAcompanhamentoDigital table.rgMasterTable tr",
-            timeout=10000,
-        )
-    except Exception:
-        pass
+    # Pausa defensiva para a tabela popular após a busca. A AMHP renderiza
+    # o cabecalho da tabela antes dos dados chegarem, entao um wait_for_selector
+    # por <tr> retornaria cedo demais e a leitura viria vazia.
+    page.wait_for_timeout(2000)
 
     log_queue.put("Extraindo dados da tabela...")
     linhas = page.locator(
@@ -609,7 +605,7 @@ def sessao_persistente_thread(usuario, senha, api_key, log_queue, cmd_queue):
                                 "Verifique as datas e tente novamente."))
                         else:
                             nome_arq = salvar_acompanhamento_xlsx(dados, credenciado, data_ini, data_fim)
-                            log_queue.put(("ACOMPANHAMENTO_OK", nome_arq, len(dados) - 1, dados))
+                            log_queue.put(("ACOMPANHAMENTO_OK", nome_arq, len(dados) - 1))
 
                     else:
                         log_queue.put(f"Comando desconhecido: {acao}")
@@ -678,7 +674,7 @@ def resetar_sessao():
     for k in ["step", "usuario", "senha", "log_queue", "cmd_queue", "browser_thread",
               "credenciados", "credenciado_atual", "referencias", "refs_multi",
               "selecionadas", "arquivos_quitacao",
-              "acomp_arquivo", "acomp_total", "acomp_dados",
+              "acomp_arquivo", "acomp_total",
               "logs_acumulados", "fluxo_atual",
               "quitacao_celebrou", "acomp_celebrou"]:
         st.session_state.pop(k, None)
@@ -804,7 +800,6 @@ DEFAULTS = {
     "arquivos_quitacao": [],
     "acomp_arquivo": None,
     "acomp_total": 0,
-    "acomp_dados": [],
     "logs_acumulados": [],
     "fluxo_atual": None,  # 'quitacao' ou 'acompanhamento'
     "erro": None,
@@ -1390,10 +1385,9 @@ elif st.session_state.step == "acomp_buscando":
         st.session_state.erro = erro
         st.session_state.step = "menu"
     else:
-        _, nome_arq, total, dados = resultado
+        _, nome_arq, total = resultado
         st.session_state.acomp_arquivo = nome_arq
         st.session_state.acomp_total   = total
-        st.session_state.acomp_dados   = dados
         st.session_state.step          = "acomp_done"
     st.rerun()
 
@@ -1405,24 +1399,12 @@ elif st.session_state.step == "acomp_done":
     banner_sessao_ativa()
     nome_arq = st.session_state.acomp_arquivo
     total    = st.session_state.acomp_total
-    dados    = st.session_state.acomp_dados or []
 
     if not st.session_state.get("acomp_celebrou"):
         st.balloons()
         st.session_state["acomp_celebrou"] = True
 
     st.success(f"✅ Concluído! {total} linha(s) encontrada(s).")
-
-    # Tabela de preview na tela
-    if dados and len(dados) > 1:
-        cabecalho = dados[0]
-        linhas    = dados[1:]
-        try:
-            df = pd.DataFrame(linhas, columns=cabecalho)
-        except Exception:
-            df = pd.DataFrame(linhas)
-        st.dataframe(df, use_container_width=True, hide_index=True, height=400)
-
     st.caption(f"📁 Salvo também em: `{PASTA_DESTINO}`")
     if nome_arq and os.path.exists(nome_arq):
         with open(nome_arq, "rb") as f:
@@ -1438,7 +1420,6 @@ elif st.session_state.step == "acomp_done":
     if st.button("← Voltar ao menu", use_container_width=True, key="voltar_acomp_done", type="primary"):
         st.session_state.acomp_arquivo = None
         st.session_state.acomp_total   = 0
-        st.session_state.acomp_dados   = []
         st.session_state.pop("acomp_celebrou", None)
         st.session_state.step          = "menu"
         st.rerun()
