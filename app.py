@@ -707,25 +707,37 @@ st.markdown("""
         border: 1px solid #c5d8ea;
     }
 
-    .stButton > button {
-        background-color: #0E1F3B !important;
-        color: #FFFFFF !important;
-        border: none !important;
+    .stButton > button,
+    .stFormSubmitButton > button {
         border-radius: 8px !important;
         font-weight: 600 !important;
         font-size: 1rem !important;
-        transition: background 0.2s !important;
+        transition: background 0.2s, border-color 0.2s !important;
+        min-height: 2.5rem !important;
     }
-    .stButton > button:hover {
+
+    /* Botão primário (azul escuro) — usado em ações principais */
+    .stButton > button[kind="primary"],
+    .stFormSubmitButton > button {
+        background-color: #0E1F3B !important;
+        color: #FFFFFF !important;
+        border: 1.5px solid #0E1F3B !important;
+    }
+    .stButton > button[kind="primary"]:hover,
+    .stFormSubmitButton > button:hover {
         background-color: #4A90C4 !important;
+        border-color: #4A90C4 !important;
     }
-    .stButton.secundario > button {
+
+    /* Botão secundário (branco com borda) — usado em ações de saída/voltar */
+    .stButton > button[kind="secondary"] {
         background-color: #FFFFFF !important;
         color: #0E1F3B !important;
         border: 1.5px solid #c5d8ea !important;
     }
-    .stButton.secundario > button:hover {
+    .stButton > button[kind="secondary"]:hover {
         background-color: #f0f4fa !important;
+        border-color: #4A90C4 !important;
     }
 
     .stTextInput > div > div > input {
@@ -845,15 +857,13 @@ def banner_sessao_ativa():
 
 def botao_cancelar_operacao(key):
     """Renderiza um botão de cancelar que encerra a sessão inteira."""
-    st.markdown('<div class="stButton secundario">', unsafe_allow_html=True)
-    clicado = st.button(
+    if st.button(
         "✖ Cancelar operação (encerra sessão)",
         use_container_width=True,
         key=key,
+        type="secondary",
         help="Cancela a operação em andamento e fecha a sessão no navegador. Você precisará logar de novo.",
-    )
-    st.markdown('</div>', unsafe_allow_html=True)
-    if clicado:
+    ):
         resetar_sessao()
         st.rerun()
 
@@ -924,7 +934,7 @@ elif st.session_state.step == "logando":
     # Botão cancelar
     col_a, col_b = st.columns([3, 1])
     with col_b:
-        if st.button("Cancelar", use_container_width=True, key="cancelar_login"):
+        if st.button("Cancelar", use_container_width=True, key="cancelar_login", type="secondary"):
             resetar_sessao()
             st.rerun()
 
@@ -995,13 +1005,11 @@ elif st.session_state.step == "escolher_credenciado":
 
     col1, col2 = st.columns(2)
     with col1:
-        st.markdown('<div class="stButton secundario">', unsafe_allow_html=True)
-        if st.button("Sair", use_container_width=True, key="sair_cred"):
+        if st.button("Sair", use_container_width=True, key="sair_cred", type="secondary"):
             resetar_sessao()
             st.rerun()
-        st.markdown('</div>', unsafe_allow_html=True)
     with col2:
-        if st.button("Continuar →", use_container_width=True, key="cont_cred"):
+        if st.button("Continuar →", use_container_width=True, key="cont_cred", type="primary"):
             st.session_state.credenciado_atual = escolha
             st.session_state.step = "menu"
             st.rerun()
@@ -1018,7 +1026,7 @@ elif st.session_state.step == "menu":
 
     st.markdown("**O que você quer fazer?**")
 
-    if st.button("📄 Relatório de Quitações", use_container_width=True, key="btn_quit"):
+    if st.button("📄 Relatório de Quitações", use_container_width=True, key="btn_quit", type="primary"):
         st.session_state.fluxo_atual = "quitacao"
         st.session_state.step = "quitacao_listando"
         st.session_state.logs_acumulados = []
@@ -1026,7 +1034,7 @@ elif st.session_state.step == "menu":
         st.session_state.cmd_queue.put(("LISTAR_REFS_QUITACAO", st.session_state.credenciado_atual))
         st.rerun()
 
-    if st.button("📋 Acompanhamento de Envios Digitais", use_container_width=True, key="btn_acomp"):
+    if st.button("📋 Acompanhamento de Envios Digitais", use_container_width=True, key="btn_acomp", type="primary"):
         st.session_state.fluxo_atual = "acompanhamento"
         st.session_state.step = "acomp_filtros"
         st.rerun()
@@ -1035,18 +1043,14 @@ elif st.session_state.step == "menu":
 
     col1, col2 = st.columns(2)
     with col1:
-        st.markdown('<div class="stButton secundario">', unsafe_allow_html=True)
         if len(st.session_state.credenciados) > 1:
-            if st.button("↺ Trocar credenciado", use_container_width=True, key="btn_trocar"):
+            if st.button("↺ Trocar credenciado", use_container_width=True, key="btn_trocar", type="secondary"):
                 st.session_state.step = "escolher_credenciado"
                 st.rerun()
-        st.markdown('</div>', unsafe_allow_html=True)
     with col2:
-        st.markdown('<div class="stButton secundario">', unsafe_allow_html=True)
-        if st.button("⎋ Encerrar sessão", use_container_width=True, key="btn_sair_menu"):
+        if st.button("⎋ Encerrar sessão", use_container_width=True, key="btn_sair_menu", type="secondary"):
             resetar_sessao()
             st.rerun()
-        st.markdown('</div>', unsafe_allow_html=True)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -1137,13 +1141,13 @@ elif st.session_state.step == "quitacao_selecionar":
     refs_filtradas = [r for r in st.session_state.referencias if filtro_lc in r.lower()]
 
     with col_m:
-        if st.button("✓ Todas", use_container_width=True, key="marcar_todas"):
+        if st.button("✓ Todas", use_container_width=True, key="marcar_todas", type="secondary"):
             # Marca todas as filtradas (preservando outras já marcadas que estão fora do filtro)
             fora_filtro = [r for r in st.session_state["refs_multi"] if r not in refs_filtradas]
             st.session_state["refs_multi"] = fora_filtro + refs_filtradas
             st.rerun()
     with col_d:
-        if st.button("✗ Nenhuma", use_container_width=True, key="desmarcar_todas"):
+        if st.button("✗ Nenhuma", use_container_width=True, key="desmarcar_todas", type="secondary"):
             # Desmarca apenas as filtradas
             st.session_state["refs_multi"] = [
                 r for r in st.session_state["refs_multi"] if r not in refs_filtradas
@@ -1170,14 +1174,12 @@ elif st.session_state.step == "quitacao_selecionar":
 
     col1, col2 = st.columns(2)
     with col1:
-        st.markdown('<div class="stButton secundario">', unsafe_allow_html=True)
-        if st.button("← Voltar ao menu", use_container_width=True, key="voltar_quit_sel"):
+        if st.button("← Voltar ao menu", use_container_width=True, key="voltar_quit_sel", type="secondary"):
             st.session_state.pop("refs_multi", None)
             st.session_state.step = "menu"
             st.rerun()
-        st.markdown('</div>', unsafe_allow_html=True)
     with col2:
-        if st.button("Exportar selecionados →", use_container_width=True, key="exp_quit"):
+        if st.button("Exportar selecionados →", use_container_width=True, key="exp_quit", type="primary"):
             if not st.session_state["refs_multi"]:
                 st.error("Selecione ao menos uma referência.")
             else:
@@ -1290,7 +1292,7 @@ elif st.session_state.step == "quitacao_done":
         st.warning("Nenhum arquivo exportado.")
 
     st.markdown("<br>", unsafe_allow_html=True)
-    if st.button("← Voltar ao menu", use_container_width=True, key="voltar_quit_done"):
+    if st.button("← Voltar ao menu", use_container_width=True, key="voltar_quit_done", type="primary"):
         st.session_state.arquivos_quitacao = []
         st.session_state.pop("quitacao_celebrou", None)
         st.session_state.pop("refs_multi", None)
@@ -1314,11 +1316,9 @@ elif st.session_state.step == "acomp_filtros":
             data_fim_dt = st.date_input("Data Fim", format="DD/MM/YYYY", value=date.today())
         buscar = st.form_submit_button("Buscar Atendimentos", use_container_width=True)
 
-    st.markdown('<div class="stButton secundario">', unsafe_allow_html=True)
-    if st.button("← Voltar ao menu", use_container_width=True, key="voltar_acomp_filtros"):
+    if st.button("← Voltar ao menu", use_container_width=True, key="voltar_acomp_filtros", type="secondary"):
         st.session_state.step = "menu"
         st.rerun()
-    st.markdown('</div>', unsafe_allow_html=True)
 
     if buscar:
         if data_ini_dt > data_fim_dt:
@@ -1421,7 +1421,7 @@ elif st.session_state.step == "acomp_done":
             )
 
     st.markdown("<br>", unsafe_allow_html=True)
-    if st.button("← Voltar ao menu", use_container_width=True, key="voltar_acomp_done"):
+    if st.button("← Voltar ao menu", use_container_width=True, key="voltar_acomp_done", type="primary"):
         st.session_state.acomp_arquivo = None
         st.session_state.acomp_total   = 0
         st.session_state.pop("acomp_celebrou", None)
