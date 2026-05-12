@@ -439,16 +439,18 @@ def buscar_acompanhamento(page, data_ini, data_fim, credenciado, log_queue):
     page.wait_for_timeout(2000)
 
     log_queue.put("Extraindo dados da tabela...")
-    linhas = page.locator(
-        "#ctl00_MainContent_rdgAcompanhamentoDigital table.rgMasterTable tr"
-    ).all()
-    dados = []
-    for linha in linhas:
-        celulas = linha.locator("th, td").all()
-        row = [c.text_content().strip() for c in celulas]
-        if any(row):
-            dados.append(row)
-    return dados
+    # Extracao em UMA chamada ao navegador (em vez de uma por celula).
+    # Acelera dramaticamente quando a tabela tem muitas linhas.
+    dados = page.evaluate("""() => {
+        const rows = Array.from(document.querySelectorAll(
+            '#ctl00_MainContent_rdgAcompanhamentoDigital table.rgMasterTable tr'
+        ));
+        return rows.map(row =>
+            Array.from(row.querySelectorAll('th, td'))
+                 .map(c => (c.innerText || '').trim())
+        ).filter(row => row.some(cell => cell.length > 0));
+    }""")
+    return dados or []
 
 
 def salvar_acompanhamento_xlsx(dados, credenciado, data_ini, data_fim):
