@@ -347,39 +347,6 @@ def selecionar_referencia(page, texto_referencia):
         pass
 
 
-def ler_tabela_extrato_visivel(page):
-    """
-    Lê a tabela de lançamentos que fica visível na página de Extrato após
-    selecionar uma referência. Retorna (cabecalho, linhas) ou ([], []) se
-    não conseguir encontrar a tabela.
-    """
-    try:
-        page.wait_for_selector(
-            "#ctl00_MainContent_pnlExtrato table.rgMasterTable, "
-            "table.rgMasterTable",
-            state="visible", timeout=15000,
-        )
-    except Exception:
-        return [], []
-
-    dados = page.evaluate("""() => {
-        const tables = Array.from(document.querySelectorAll('table.rgMasterTable'));
-        if (!tables.length) return null;
-        // Escolhe a tabela com mais linhas (a do extrato é a principal).
-        let melhor = tables[0];
-        for (const t of tables) {
-            if (t.rows.length > melhor.rows.length) melhor = t;
-        }
-        return Array.from(melhor.rows).map(row =>
-            Array.from(row.cells).map(c => (c.innerText || '').trim())
-        );
-    }""")
-
-    if not dados or len(dados) < 1:
-        return [], []
-    return dados[0], dados[1:]
-
-
 def exportar_csv(page, texto_referencia, usuario):
     selecionar_referencia(page, texto_referencia)
     page.locator("#ctl00_MainContent_rbtExportarCsv_input").click()
@@ -608,14 +575,6 @@ def sessao_persistente_thread(usuario, senha, api_key, log_queue, cmd_queue):
                         log_queue.put(f"{len(refs)} referência(s) encontrada(s).")
                         log_queue.put(("REFERENCIAS", refs))
 
-                    elif acao == "PREVIEW_QUITACAO":
-                        _, referencia = cmd
-                        log_queue.put(f"Carregando dados de {referencia}...")
-                        selecionar_referencia(page, referencia)
-                        cabecalho, linhas = ler_tabela_extrato_visivel(page)
-                        log_queue.put(f"Tabela carregada: {len(linhas)} linha(s).")
-                        log_queue.put(("PREVIEW_QUITACAO_OK", referencia, cabecalho, linhas))
-
                     elif acao == "RODAR_QUITACAO":
                         _, credenciado, selecionadas = cmd
                         arquivos = []
@@ -717,9 +676,9 @@ def resetar_sessao():
     """Limpa todo o estado da sessão (após sair ou erro fatal)."""
     encerrar_sessao_silenciosa()
     for k in ["step", "usuario", "senha", "log_queue", "cmd_queue", "browser_thread",
-              "credenciados", "credenciado_atual", "referencias", "referencia_atual",
-              "preview_cabecalho", "preview_linhas", "selecionadas",
-              "arquivos_quitacao", "acomp_arquivo", "acomp_total", "acomp_dados",
+              "credenciados", "credenciado_atual", "referencias", "refs_multi",
+              "selecionadas", "arquivos_quitacao",
+              "acomp_arquivo", "acomp_total", "acomp_dados",
               "logs_acumulados", "fluxo_atual",
               "quitacao_celebrou", "acomp_celebrou"]:
         st.session_state.pop(k, None)
@@ -841,9 +800,6 @@ DEFAULTS = {
     "credenciados": [],
     "credenciado_atual": None,
     "referencias": [],
-    "referencia_atual": None,
-    "preview_cabecalho": [],
-    "preview_linhas": [],
     "selecionadas": [],
     "arquivos_quitacao": [],
     "acomp_arquivo": None,
@@ -1168,134 +1124,75 @@ elif st.session_state.step == "quitacao_listando":
 elif st.session_state.step == "quitacao_selecionar":
     banner_sessao_ativa()
     st.markdown(f"**{len(st.session_state.referencias)} referência(s) disponível(is)**")
-    st.caption("Escolha uma referência para visualizar antes de exportar.")
 
-    referencia = st.selectbox(
-        "Referência:",
-        options=st.session_state.referencias,
-        index=0,
-        key="ref_unica",
-        label_visibility="collapsed",
+    # Inicializa a seleção uma única vez (primeira referência)
+    if "refs_multi" not in st.session_state:
+        st.session_state["refs_multi"] = (
+            st.session_state.referencias[:1] if st.session_state.referencias else []
+        )
+
+    # Filtro + botões marcar/desmarcar
+    col_filtro, col_m, col_d = st.columns([3, 1, 1])
+    with col_filtro:
+        filtro = st.text_input(
+            "Filtrar",
+            placeholder="Ex: 2025, Out, ...",
+            label_visibility="collapsed",
+            key="filtro_refs",
+        )
+    filtro_lc = (filtro or "").lower()
+    refs_filtradas = [r for r in st.session_state.referencias if filtro_lc in r.lower()]
+
+    with col_m:
+        if st.button("✓ Todas", use_container_width=True, key="marcar_todas", type="secondary"):
+            fora_filtro = [r for r in st.session_state["refs_multi"] if r not in refs_filtradas]
+            st.session_state["refs_multi"] = fora_filtro + refs_filtradas
+            st.rerun()
+    with col_d:
+        if st.button("✗ Nenhuma", use_container_width=True, key="desmarcar_todas", type="secondary"):
+            st.session_state["refs_multi"] = [
+                r for r in st.session_state["refs_multi"] if r not in refs_filtradas
+            ]
+            st.rerun()
+
+    if filtro_lc:
+        st.caption(f"Mostrando {len(refs_filtradas)} de {len(st.session_state.referencias)}")
+
+    selecionadas_visiveis = st.multiselect(
+        "Selecione as referências para exportar:",
+        options=refs_filtradas,
+        default=[r for r in st.session_state["refs_multi"] if r in refs_filtradas],
+        key="multi_widget",
     )
+    invisiveis = [r for r in st.session_state["refs_multi"] if r not in refs_filtradas]
+    st.session_state["refs_multi"] = invisiveis + selecionadas_visiveis
+
+    total_marcadas = len(st.session_state["refs_multi"])
+    if total_marcadas:
+        st.caption(f"📌 {total_marcadas} referência(s) marcada(s) no total")
 
     col1, col2 = st.columns(2)
     with col1:
         if st.button("← Voltar ao menu", use_container_width=True,
                      key="voltar_quit_sel", type="secondary"):
+            st.session_state.pop("refs_multi", None)
             st.session_state.step = "menu"
             st.rerun()
     with col2:
-        if st.button("👁 Visualizar dados →", use_container_width=True,
-                     key="ver_quit", type="primary"):
-            st.session_state.referencia_atual = referencia
-            st.session_state.logs_acumulados = []
-            esvaziar_log_queue()
-            st.session_state.cmd_queue.put(("PREVIEW_QUITACAO", referencia))
-            st.session_state.step = "quitacao_carregando_preview"
-            st.rerun()
-
-
-# ──────────────────────────────────────────────────────────────────
-# TELA: Quitação — carregando preview da referência escolhida
-# ──────────────────────────────────────────────────────────────────
-elif st.session_state.step == "quitacao_carregando_preview":
-    banner_sessao_ativa()
-    log_queue = st.session_state.log_queue
-    thread    = st.session_state.browser_thread
-    ESTIMATIVA = 10
-
-    st.markdown(f"**Carregando dados de {st.session_state.referencia_atual}...**")
-    progress_bar = st.progress(0.0)
-    col_t, col_m = st.columns([1, 3])
-    timer_ph     = col_t.empty()
-    msg_ph       = col_m.empty()
-    status_ph    = st.empty()
-    botao_cancelar_operacao(key="cancel_quit_preview")
-
-    start_time = time.time()
-    eventos    = []
-    logs       = st.session_state.logs_acumulados
-    preview, erro = None, None
-
-    while preview is None and erro is None:
-        elapsed = time.time() - start_time
-        progress_bar.progress(min(elapsed / ESTIMATIVA, 0.95))
-        timer_ph.metric("⏱", f"{int(elapsed)}s")
-        if elapsed < ESTIMATIVA:
-            msg_ph.caption(f"Tempo estimado: ~{ESTIMATIVA}s")
-        else:
-            msg_ph.caption("⚠️ Tá demorando mais que o normal...")
-
-        drenar_log_queue(log_queue, eventos, logs)
-        for ev in eventos:
-            if ev[0] == "PREVIEW_QUITACAO_OK":
-                preview = ev  # ("PREVIEW_QUITACAO_OK", ref, cabecalho, linhas)
-            elif ev[0] in ("ERRO_OPERACAO", "ERRO_LOGIN"):
-                erro = ev[1]
-        eventos.clear()
-
-        if logs:
-            status_ph.info(logs[-1])
-
-        if preview is None and erro is None:
-            if not thread.is_alive():
-                erro = "A sessão encerrou inesperadamente."
-                break
-            time.sleep(0.2)
-
-    progress_bar.progress(1.0)
-
-    if erro:
-        st.session_state.erro = erro
-        st.session_state.step = "menu"
-    else:
-        _, ref, cabecalho, linhas = preview
-        st.session_state.preview_cabecalho = cabecalho
-        st.session_state.preview_linhas    = linhas
-        st.session_state.step              = "quitacao_preview"
-    st.rerun()
-
-
-# ──────────────────────────────────────────────────────────────────
-# TELA: Quitação — preview da tabela
-# ──────────────────────────────────────────────────────────────────
-elif st.session_state.step == "quitacao_preview":
-    banner_sessao_ativa()
-    ref = st.session_state.referencia_atual
-    cabecalho = st.session_state.preview_cabecalho
-    linhas    = st.session_state.preview_linhas
-
-    st.markdown(f"**Referência:** {ref}")
-    st.caption(f"📊 {len(linhas)} linha(s) encontrada(s)")
-
-    if linhas:
-        try:
-            df = pd.DataFrame(linhas, columns=cabecalho or None)
-        except Exception:
-            df = pd.DataFrame(linhas)
-        st.dataframe(df, use_container_width=True, hide_index=True, height=400)
-    else:
-        st.warning("Não foi possível carregar a tabela na tela. Você ainda pode tentar exportar diretamente.")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("← Escolher outra", use_container_width=True,
-                     key="outra_ref", type="secondary"):
-            st.session_state.pop("preview_cabecalho", None)
-            st.session_state.pop("preview_linhas", None)
-            st.session_state.step = "quitacao_selecionar"
-            st.rerun()
-    with col2:
-        if st.button("⬇️ Exportar este (CSV) →", use_container_width=True,
-                     key="exp_quit_unica", type="primary"):
-            st.session_state.selecionadas = [ref]
-            st.session_state.logs_acumulados = []
-            esvaziar_log_queue()
-            st.session_state.cmd_queue.put(
-                ("RODAR_QUITACAO", st.session_state.credenciado_atual, [ref])
-            )
-            st.session_state.step = "quitacao_exportando"
-            st.rerun()
+        if st.button("Exportar selecionados →", use_container_width=True,
+                     key="exp_quit", type="primary"):
+            if not st.session_state["refs_multi"]:
+                st.error("Selecione ao menos uma referência.")
+            else:
+                st.session_state.selecionadas = list(st.session_state["refs_multi"])
+                st.session_state.logs_acumulados = []
+                esvaziar_log_queue()
+                st.session_state.cmd_queue.put(
+                    ("RODAR_QUITACAO", st.session_state.credenciado_atual,
+                     st.session_state.selecionadas)
+                )
+                st.session_state.step = "quitacao_exportando"
+                st.rerun()
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -1398,10 +1295,8 @@ elif st.session_state.step == "quitacao_done":
     st.markdown("<br>", unsafe_allow_html=True)
     if st.button("← Voltar ao menu", use_container_width=True, key="voltar_quit_done", type="primary"):
         st.session_state.arquivos_quitacao = []
-        st.session_state.preview_cabecalho = []
-        st.session_state.preview_linhas    = []
-        st.session_state.referencia_atual  = None
         st.session_state.pop("quitacao_celebrou", None)
+        st.session_state.pop("refs_multi", None)
         st.session_state.step = "menu"
         st.rerun()
 
