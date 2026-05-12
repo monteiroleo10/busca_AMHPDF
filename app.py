@@ -168,7 +168,8 @@ def login_com_2captcha(page, usuario, senha, api_key, log_queue):
         pass
 
     page.goto(URL_PORTAL)
-    page.wait_for_load_state("networkidle")
+    # DOM pronto basta — o detectar_sitekey já espera o script do reCAPTCHA carregar.
+    page.wait_for_load_state("domcontentloaded")
 
     for selector in ["input[name='username']", "input[name='user']", "input[type='text']"]:
         try:
@@ -257,9 +258,8 @@ def obter_credenciados_disponiveis(page, log_queue):
     page.locator("#ctl00_MainContent_rcbCredenciado_Input").click()
     page.wait_for_selector(
         "#ctl00_MainContent_rcbCredenciado_DropDown .rcbList li",
-        timeout=10000,
+        state="visible", timeout=10000,
     )
-    page.wait_for_timeout(500)
     itens = page.locator("#ctl00_MainContent_rcbCredenciado_DropDown .rcbList li")
     credenciados = []
     for i in range(itens.count()):
@@ -267,7 +267,6 @@ def obter_credenciados_disponiveis(page, log_queue):
         if txt:
             credenciados.append(txt)
     page.keyboard.press("Escape")
-    page.wait_for_timeout(500)
     return credenciados
 
 
@@ -282,10 +281,13 @@ def selecionar_credenciado_no_dropdown(page, credenciado, prefixo_id):
 
     page.wait_for_selector(input_sel, timeout=15000)
     page.locator(input_sel).click()
-    page.wait_for_selector(dropdown_sel, timeout=10000)
-    page.wait_for_timeout(500)
+    page.wait_for_selector(dropdown_sel, state="visible", timeout=10000)
     page.locator(f"{dropdown_sel}:has-text('{codigo}')").first.click()
-    page.wait_for_timeout(800)
+    # Espera o dropdown fechar para confirmar que a seleção foi aceita.
+    try:
+        page.wait_for_selector(dropdown_sel, state="hidden", timeout=3000)
+    except Exception:
+        pass
 
 
 # ─── QUITAÇÃO ─────────────────────────────────────────────────────
@@ -293,14 +295,14 @@ def selecionar_credenciado_no_dropdown(page, credenciado, prefixo_id):
 def navegar_para_extrato(page, credenciado, log_queue):
     """Vai para a página de Extrato e seleciona o credenciado."""
     page.goto(URL_EXTRATO)
-    page.wait_for_load_state("networkidle")
+    # DOM pronto basta — temos waits específicos abaixo.
+    page.wait_for_load_state("domcontentloaded")
 
-    # Se a página de Extrato tem um seletor de credenciado, usa.
-    # O ID provável segue o padrão da AMHPTISS (Telerik RadComboBox).
     try:
         page.wait_for_selector("#ctl00_MainContent_rcbCredenciado_Input", timeout=5000)
         log_queue.put("Selecionando credenciado na página de Extrato...")
         selecionar_credenciado_no_dropdown(page, credenciado, "ctl00_MainContent_rcbCredenciado")
+        # Após a seleção, esperar a página estabilizar (a AMHP refaz a lista de referências).
         page.wait_for_load_state("networkidle")
     except Exception:
         # Página de Extrato não tem seletor de credenciado (caso de login com só 1).
@@ -315,16 +317,14 @@ def obter_referencias_disponiveis(page):
     page.locator("#ctl00_MainContent_rcbReferencia_Input").click()
     page.wait_for_selector(
         "#ctl00_MainContent_rcbReferencia_DropDown .rcbList li",
-        timeout=15000,
+        state="visible", timeout=15000,
     )
-    page.wait_for_timeout(500)
     refs = page.evaluate("""() =>
         Array.from(document.querySelectorAll('#ctl00_MainContent_rcbReferencia_DropDown .rcbList li'))
             .map(el => el.textContent.trim())
             .filter(t => t.length > 0)
     """)
     page.keyboard.press("Escape")
-    page.wait_for_timeout(500)
     return refs
 
 
@@ -332,34 +332,41 @@ def selecionar_referencia(page, texto_referencia):
     page.locator("#ctl00_MainContent_rcbReferencia_Input").click()
     page.wait_for_selector(
         "#ctl00_MainContent_rcbReferencia_DropDown .rcbList li",
-        timeout=10000,
+        state="visible", timeout=10000,
     )
-    page.wait_for_timeout(800)
     page.locator(
         f"#ctl00_MainContent_rcbReferencia_DropDown .rcbList li:has-text('{texto_referencia}')"
     ).first.click(timeout=10000)
-    page.wait_for_timeout(1000)
+    # Espera o dropdown fechar para confirmar a seleção.
+    try:
+        page.wait_for_selector(
+            "#ctl00_MainContent_rcbReferencia_DropDown .rcbList li",
+            state="hidden", timeout=3000,
+        )
+    except Exception:
+        pass
 
 
 def exportar_csv(page, texto_referencia, usuario):
     selecionar_referencia(page, texto_referencia)
     page.locator("#ctl00_MainContent_rbtExportarCsv_input").click()
-    page.wait_for_timeout(2000)
 
     caminho = None
     try:
+        # Espera o iframe do popup aparecer — substitui a antiga pausa fixa de 2s.
         page.wait_for_selector("iframe[src*='ExtratoExportacao'][tabindex='0']", timeout=15000)
         frame = page.frame(url="*ExtratoExportacao*")
         if frame:
             frame.wait_for_load_state("load")
-        page.wait_for_timeout(1000)
 
         popup = page.frame_locator("iframe[src*='ExtratoExportacao'][tabindex='0']")
+        # Espera o conteúdo do popup estar interativo.
+        popup.locator("#rbtExportarCsv_input").wait_for(state="visible", timeout=15000)
+
         try:
             popup.locator("a.rlbTransferAllFrom").first.click(timeout=5000)
         except Exception:
             pass
-        page.wait_for_timeout(1000)
 
         with page.expect_download(timeout=120000) as dl:
             popup.locator("#rbtExportarCsv_input").click(timeout=10000)
@@ -378,7 +385,6 @@ def exportar_csv(page, texto_referencia, usuario):
         download.save_as(caminho)
     finally:
         page.evaluate("document.querySelectorAll('[id^=\"RadWindowWrapper_\"], .TelerikModalOverlay').forEach(el => el.remove())")
-        page.wait_for_timeout(500)
 
     return caminho
 
@@ -427,7 +433,14 @@ def buscar_acompanhamento(page, data_ini, data_fim, credenciado, log_queue):
         page.wait_for_selector(".raDiv", state="hidden", timeout=30000)
     except Exception:
         pass
-    page.wait_for_timeout(2000)
+    # Espera a tabela renderizar (substitui pausa fixa de 2s).
+    try:
+        page.wait_for_selector(
+            "#ctl00_MainContent_rdgAcompanhamentoDigital table.rgMasterTable tr",
+            timeout=10000,
+        )
+    except Exception:
+        pass
 
     log_queue.put("Extraindo dados da tabela...")
     linhas = page.locator(
@@ -574,11 +587,14 @@ def sessao_persistente_thread(usuario, senha, api_key, log_queue, cmd_queue):
                                 if caminho:
                                     arquivos.append(caminho)
                                     log_queue.put(f"  Salvo: {os.path.basename(caminho)}")
-                                time.sleep(2)
+                                # Pausa curta entre exportações para o site se estabilizar.
+                                time.sleep(0.5)
                             except Exception as e:
                                 log_queue.put(f"  Erro em {ref}: {e}")
 
-                        if arquivos:
+                        # Só gera o consolidado quando há mais de 1 arquivo —
+                        # com um CSV só, o consolidado seria redundante.
+                        if len(arquivos) > 1:
                             log_queue.put("Consolidando em Excel...")
                             excel = consolidar_excel(arquivos, usuario)
                             arquivos.append(excel)
