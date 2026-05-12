@@ -1,5 +1,11 @@
 """
 Exportar Extrato AMHPTISS — Interface Streamlit
+
+Fluxo:
+  1. Login (uma única vez por sessão)
+  2. Seleção de credenciado (pulada quando há apenas 1)
+  3. Menu de relatórios
+  4. Relatório escolhido → volta ao menu
 """
 import streamlit as st
 import threading
@@ -13,6 +19,7 @@ import urllib.parse
 import base64
 import pandas as pd
 import openpyxl
+from datetime import date
 from playwright.sync_api import sync_playwright
 
 
@@ -24,6 +31,11 @@ else:
     PASTA_DESTINO = "/tmp/extratos_amhp"
 
 HEADLESS = platform.system() != "Windows"
+
+URL_PORTAL          = "https://portal.amhp.com.br/"
+URL_PERFIL          = "https://portal.amhp.com.br/pages/PJ/perfil.html"
+URL_EXTRATO         = "https://amhptiss.amhp.com.br/Extrato.aspx"
+URL_ACOMPANHAMENTO  = "https://amhptiss.amhp.com.br/AcompanhamentoAtendimentoDigital.aspx"
 
 
 def carregar_api_key():
@@ -52,12 +64,6 @@ def diagnosticar_pagina(page, log_queue, prefixo=""):
         log_queue.put(f"{prefixo}Titulo: {page.title()}")
         texto = page.evaluate("() => document.body ? document.body.innerText.slice(0, 600) : ''")
         log_queue.put(f"{prefixo}Texto: {texto}")
-        inputs = page.evaluate("""() => Array.from(document.querySelectorAll('input')).map(i => ({
-            type: i.type, name: i.name, id: i.id,
-            value: (i.name === 'g-recaptcha-response' ? i.value.slice(0, 50) : i.value.slice(0, 10)) || '(vazio)'
-        }))""")
-        log_queue.put(f"{prefixo}Inputs: {inputs}")
-        page.screenshot(path="/tmp/amhp_debug.png", full_page=False)
     except Exception as e:
         log_queue.put(f"{prefixo}Erro no diagnostico: {e}")
 
@@ -79,11 +85,9 @@ def detectar_sitekey(page, log_queue):
         const actionEl = document.querySelector('input[name="action"]');
         if (actionEl) action = actionEl.value;
 
-        // data-sitekey (v2 widget)
         const el = document.querySelector('[data-sitekey]');
         if (el) sitekey = el.getAttribute('data-sitekey');
 
-        // iframe do reCAPTCHA (v2)
         if (!sitekey) {
             for (const f of document.querySelectorAll('iframe')) {
                 const m = f.src.match(/[?&]k=([^&]+)/);
@@ -91,7 +95,6 @@ def detectar_sitekey(page, log_queue):
             }
         }
 
-        // script externo com render= (v3)
         if (!sitekey) {
             for (const s of document.scripts) {
                 if (s.src) {
@@ -101,7 +104,6 @@ def detectar_sitekey(page, log_queue):
             }
         }
 
-        // scripts inline
         if (!sitekey) {
             for (const s of document.scripts) {
                 const t = s.text || '';
@@ -115,16 +117,12 @@ def detectar_sitekey(page, log_queue):
         return { sitekey, action, versao };
     }""")
 
-    sitekey = resultado.get("sitekey")
-    action  = resultado.get("action")
-    versao  = resultado.get("versao", "v2")
-
-    return sitekey, versao, action
+    return resultado.get("sitekey"), resultado.get("versao", "v2"), resultado.get("action")
 
 
 # ─── 2CAPTCHA ─────────────────────────────────────────────────────
 
-def resolver_captcha(sitekey, page_url, api_key, log_queue, versao="v2", action=None):
+def resolver_captcha(sitekey, page_url, api_key, versao="v2", action=None):
     from twocaptcha import TwoCaptcha
     solver = TwoCaptcha(api_key)
     if versao == "v3":
@@ -146,7 +144,7 @@ def login_com_2captcha(page, usuario, senha, api_key, log_queue):
     except Exception:
         pass
 
-    page.goto("https://portal.amhp.com.br/")
+    page.goto(URL_PORTAL)
     page.wait_for_load_state("networkidle")
 
     for selector in ["input[name='username']", "input[name='user']", "input[type='text']"]:
@@ -162,20 +160,17 @@ def login_com_2captcha(page, usuario, senha, api_key, log_queue):
 
     sitekey, versao, action = detectar_sitekey(page, log_queue)
     if not sitekey:
-        raise Exception("Sitekey do reCAPTCHA nao encontrado na pagina de login.")
+        raise Exception("captcha_sitekey_nao_encontrado")
 
-    token = resolver_captcha(sitekey, page.url, api_key, log_queue, versao=versao, action=action)
-
-    interceptado = [False]
+    token = resolver_captcha(sitekey, page.url, api_key, versao=versao, action=action)
 
     def trocar_token(route, request):
         if request.method == "POST" and "portal.amhp.com.br" in request.url:
-            pd = request.post_data or ""
-            if "g-recaptcha-response" in pd:
+            pd_post = request.post_data or ""
+            if "g-recaptcha-response" in pd_post:
                 try:
-                    params = dict(urllib.parse.parse_qsl(pd, keep_blank_values=True))
+                    params = dict(urllib.parse.parse_qsl(pd_post, keep_blank_values=True))
                     params["g-recaptcha-response"] = token
-                    interceptado[0] = True
                     route.continue_(post_data=urllib.parse.urlencode(params))
                     return
                 except Exception:
@@ -195,16 +190,37 @@ def login_com_2captcha(page, usuario, senha, api_key, log_queue):
     return "perfil" in page.url
 
 
-def validar_sessao(page):
-    page.goto("https://portal.amhp.com.br/pages/PJ/perfil.html")
-    page.wait_for_load_state("networkidle")
-    return "perfil" in page.url
+def classificar_erro_login(exc):
+    """Converte erros técnicos do login em mensagens claras pro usuário."""
+    msg = str(exc).lower()
+    if "captcha_sitekey_nao_encontrado" in msg:
+        return ("O site da AMHP não está mostrando o campo de captcha como deveria. "
+                "Isso geralmente é uma instabilidade temporária do site. "
+                "Aguarde alguns minutos e tente novamente.")
+    if "saldo" in msg or "balance" in msg or "no_money" in msg or "zero_balance" in msg:
+        return ("O serviço de captcha está sem créditos. "
+                "Avise o Lucas para renovar a chave do 2captcha.")
+    if "wrong" in msg or "incorrect" in msg or "invalid" in msg or "error_wrong" in msg:
+        return ("O captcha foi resolvido, mas o site recusou. "
+                "Pode ser CPF/CNPJ ou senha incorretos. "
+                "Verifique seus dados e tente novamente.")
+    if "timeout" in msg and ("portal.amhp" in msg or "amhp.com" in msg):
+        return ("O site da AMHP está muito lento ou fora do ar. "
+                "Tente novamente em alguns minutos.")
+    if "net::" in msg or "connection" in msg:
+        return ("Não foi possível conectar ao site da AMHP. "
+                "Verifique sua internet ou tente novamente mais tarde.")
+    return f"Não conseguimos completar o login. Detalhes técnicos: {exc}"
 
 
-# ─── NAVEGACAO E EXPORTACAO ───────────────────────────────────────
+# ─── CREDENCIADOS ─────────────────────────────────────────────────
 
-def navegar_para_extrato(page, log_queue):
-    # Após login bem-sucedido já estamos em perfil.html — sem goto redundante
+def obter_credenciados_disponiveis(page, log_queue):
+    """
+    Coleta a lista de credenciados disponíveis para esse login.
+    Usa a página de Acompanhamento como ponto de coleta (sabemos que o
+    dropdown está lá; o mesmo conjunto vale para todos os relatórios).
+    """
     try:
         page.wait_for_selector("text=AMHPTISS", timeout=8000)
         page.get_by_text("AMHPTISS", exact=False).first.click()
@@ -212,16 +228,75 @@ def navegar_para_extrato(page, log_queue):
     except Exception:
         pass
 
-    page.goto("https://amhptiss.amhp.com.br/Extrato.aspx")
+    page.goto(URL_ACOMPANHAMENTO)
+    page.wait_for_load_state("domcontentloaded")
+    page.wait_for_selector("#ctl00_MainContent_rcbCredenciado_Input", timeout=30000)
+    page.locator("#ctl00_MainContent_rcbCredenciado_Input").click()
+    page.wait_for_selector(
+        "#ctl00_MainContent_rcbCredenciado_DropDown .rcbList li",
+        timeout=10000,
+    )
+    page.wait_for_timeout(500)
+    itens = page.locator("#ctl00_MainContent_rcbCredenciado_DropDown .rcbList li")
+    credenciados = []
+    for i in range(itens.count()):
+        txt = itens.nth(i).text_content().strip()
+        if txt:
+            credenciados.append(txt)
+    page.keyboard.press("Escape")
+    page.wait_for_timeout(500)
+    return credenciados
+
+
+def selecionar_credenciado_no_dropdown(page, credenciado, prefixo_id):
+    """
+    Seleciona um credenciado em um dropdown do tipo RadComboBox (Telerik).
+    `prefixo_id` é o prefixo do componente, ex: 'ctl00_MainContent_rcbCredenciado'.
+    """
+    codigo = credenciado.split(" - ")[0].strip()
+    input_sel    = f"#{prefixo_id}_Input"
+    dropdown_sel = f"#{prefixo_id}_DropDown .rcbList li"
+
+    page.wait_for_selector(input_sel, timeout=15000)
+    page.locator(input_sel).click()
+    page.wait_for_selector(dropdown_sel, timeout=10000)
+    page.wait_for_timeout(500)
+    page.locator(f"{dropdown_sel}:has-text('{codigo}')").first.click()
+    page.wait_for_timeout(800)
+
+
+# ─── QUITAÇÃO ─────────────────────────────────────────────────────
+
+def navegar_para_extrato(page, credenciado, log_queue):
+    """Vai para a página de Extrato e seleciona o credenciado."""
+    page.goto(URL_EXTRATO)
     page.wait_for_load_state("networkidle")
-    return page
+
+    # Se a página de Extrato tem um seletor de credenciado, usa.
+    # O ID provável segue o padrão da AMHPTISS (Telerik RadComboBox).
+    try:
+        page.wait_for_selector("#ctl00_MainContent_rcbCredenciado_Input", timeout=5000)
+        log_queue.put("Selecionando credenciado na página de Extrato...")
+        selecionar_credenciado_no_dropdown(page, credenciado, "ctl00_MainContent_rcbCredenciado")
+        page.wait_for_load_state("networkidle")
+    except Exception:
+        # Página de Extrato não tem seletor de credenciado (caso de login com só 1).
+        pass
+
+    # Aguarda o dropdown de referências aparecer.
+    page.wait_for_selector("#ctl00_MainContent_rcbReferencia_Input", timeout=20000)
 
 
 def obter_referencias_disponiveis(page):
+    """Lista as referências (meses) disponíveis para exportar."""
     page.locator("#ctl00_MainContent_rcbReferencia_Input").click()
-    page.wait_for_selector("li.rcbItem", timeout=15000)
+    page.wait_for_selector(
+        "#ctl00_MainContent_rcbReferencia_DropDown .rcbList li",
+        timeout=15000,
+    )
+    page.wait_for_timeout(500)
     refs = page.evaluate("""() =>
-        Array.from(document.querySelectorAll('li.rcbItem'))
+        Array.from(document.querySelectorAll('#ctl00_MainContent_rcbReferencia_DropDown .rcbList li'))
             .map(el => el.textContent.trim())
             .filter(t => t.length > 0)
     """)
@@ -232,8 +307,14 @@ def obter_referencias_disponiveis(page):
 
 def selecionar_referencia(page, texto_referencia):
     page.locator("#ctl00_MainContent_rcbReferencia_Input").click()
-    page.wait_for_timeout(1500)
-    page.locator(f"li.rcbItem:has-text('{texto_referencia}')").first.click(timeout=10000)
+    page.wait_for_selector(
+        "#ctl00_MainContent_rcbReferencia_DropDown .rcbList li",
+        timeout=10000,
+    )
+    page.wait_for_timeout(800)
+    page.locator(
+        f"#ctl00_MainContent_rcbReferencia_DropDown .rcbList li:has-text('{texto_referencia}')"
+    ).first.click(timeout=10000)
     page.wait_for_timeout(1000)
 
 
@@ -295,108 +376,7 @@ def consolidar_excel(arquivos, usuario):
     return nome_excel
 
 
-# ─── FLUXO PRINCIPAL ──────────────────────────────────────────────
-
-def _criar_browser(p):
-    if platform.system() == "Windows":
-        return p.chromium.launch(headless=HEADLESS, executable_path=encontrar_chromium())
-    return p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-
-
-def _criar_context(browser):
-    return browser.new_context(
-        accept_downloads=True,
-        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    )
-
-
-def sessao_unica_thread(usuario, senha, api_key, log_queue, cmd_queue):
-    try:
-        log_queue.put("Iniciando sessão...")
-        with sync_playwright() as p:
-            browser = _criar_browser(p)
-            page = _criar_context(browser).new_page()
-
-            log_queue.put("Autenticando...")
-            ok = login_com_2captcha(page, usuario, senha, api_key, log_queue)
-
-            if not ok:
-                raise Exception("Login falhou. Verifique CPF/CNPJ, senha e saldo no 2captcha.")
-
-            log_queue.put("Login realizado! Buscando referências disponíveis...")
-            page = navegar_para_extrato(page, log_queue)
-            refs = obter_referencias_disponiveis(page)
-            log_queue.put(f"{len(refs)} referência(s) encontrada(s).")
-            log_queue.put(("REFERENCIAS", refs))
-
-            # Pausa aqui aguardando a seleção do usuário
-            selecionadas = cmd_queue.get()
-
-            if selecionadas is None:
-                browser.close()
-                return
-
-            arquivos = []
-            log_queue.put(f"Exportando {len(selecionadas)} referência(s)...")
-            for i, ref in enumerate(selecionadas):
-                log_queue.put(f"  [{i+1}/{len(selecionadas)}] {ref}")
-                try:
-                    caminho = exportar_csv(page, ref, usuario)
-                    if caminho:
-                        arquivos.append(caminho)
-                        log_queue.put(f"  Salvo: {os.path.basename(caminho)}")
-                    time.sleep(2)
-                except Exception as e:
-                    log_queue.put(f"  Erro em {ref}: {e}")
-
-            browser.close()
-
-        if arquivos:
-            log_queue.put("Consolidando em Excel...")
-            excel = consolidar_excel(arquivos, usuario)
-            arquivos.append(excel)
-
-        log_queue.put(("CONCLUIDO", arquivos))
-
-    except Exception as e:
-        import traceback
-        log_queue.put(f"Erro: {e}")
-        log_queue.put(traceback.format_exc())
-        log_queue.put(("ERRO", str(e)))
-
-
-# ─── ACOMPANHAMENTO ENVIOS DIGITAIS ───────────────────────────────
-
-URL_ACOMPANHAMENTO = "https://amhptiss.amhp.com.br/AcompanhamentoAtendimentoDigital.aspx"
-
-
-def obter_credenciados_acompanhamento(page):
-    # Estabelece sessão no amhptiss (mesmo SSO do extrato)
-    try:
-        page.wait_for_selector("text=AMHPTISS", timeout=8000)
-        page.get_by_text("AMHPTISS", exact=False).first.click()
-        page.wait_for_load_state("load")
-    except Exception:
-        pass
-
-    page.goto(URL_ACOMPANHAMENTO)
-    page.wait_for_load_state("domcontentloaded")
-    page.wait_for_selector("#ctl00_MainContent_rcbCredenciado_Input", timeout=30000)
-    page.locator("#ctl00_MainContent_rcbCredenciado_Input").click()
-    page.wait_for_selector(
-        "#ctl00_MainContent_rcbCredenciado_DropDown .rcbList li",
-        timeout=10000,
-    )
-    itens = page.locator("#ctl00_MainContent_rcbCredenciado_DropDown .rcbList li")
-    credenciados = [
-        itens.nth(i).text_content().strip()
-        for i in range(itens.count())
-        if itens.nth(i).text_content().strip()
-    ]
-    page.keyboard.press("Escape")
-    page.wait_for_timeout(500)
-    return credenciados
-
+# ─── ACOMPANHAMENTO ───────────────────────────────────────────────
 
 def buscar_acompanhamento(page, data_ini, data_fim, credenciado, log_queue):
     log_queue.put("Navegando para a página de envios digitais...")
@@ -416,17 +396,7 @@ def buscar_acompanhamento(page, data_ini, data_fim, credenciado, log_queue):
     campo_fim.type(data_fim)
     campo_fim.press("Tab")
 
-    # Abre o dropdown e clica diretamente no item pelo código único
-    codigo = credenciado.split(" - ")[0].strip()
-    cred_input = page.locator("#ctl00_MainContent_rcbCredenciado_Input")
-    cred_input.click()
-    page.wait_for_selector(
-        "#ctl00_MainContent_rcbCredenciado_DropDown .rcbList li",
-        timeout=10000,
-    )
-    page.wait_for_timeout(500)
-    page.locator(f"#ctl00_MainContent_rcbCredenciado_DropDown .rcbList li:has-text('{codigo}')").click()
-    page.wait_for_timeout(500)
+    selecionar_credenciado_no_dropdown(page, credenciado, "ctl00_MainContent_rcbCredenciado")
 
     log_queue.put("Executando busca...")
     page.locator("#ctl00_MainContent_btnBuscarAtendimentos_input").click()
@@ -449,66 +419,229 @@ def buscar_acompanhamento(page, data_ini, data_fim, credenciado, log_queue):
     return dados
 
 
-def acompanhamento_thread(usuario, senha, api_key, log_queue, cmd_queue):
+def salvar_acompanhamento_xlsx(dados, credenciado, data_ini, data_fim):
+    """Cria a planilha Excel a partir dos dados extraídos da tabela."""
+    os.makedirs(PASTA_DESTINO, exist_ok=True)
+    credenciado_slug = credenciado[:6].strip().replace(" ", "_")
+    nome_arq = os.path.join(
+        PASTA_DESTINO,
+        f"Acompanhamento_{credenciado_slug}_{data_ini.replace('/', '')}_{data_fim.replace('/', '')}.xlsx",
+    )
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Envios Digitais"
+    for row in dados:
+        ws.append(row)
+    # Coluna J (índice 10) — converte para número quando possível
+    for row in ws.iter_rows(min_row=2, min_col=10, max_col=10):
+        for cell in row:
+            if cell.value:
+                try:
+                    cell.value = float(str(cell.value).replace(",", ".").replace(" ", ""))
+                except (ValueError, TypeError):
+                    pass
+    for col in ws.columns:
+        max_len = max((len(str(cell.value)) for cell in col if cell.value), default=10)
+        ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 50)
+    wb.save(nome_arq)
+    return nome_arq
+
+
+# ─── BROWSER ──────────────────────────────────────────────────────
+
+def _criar_browser(p):
+    if platform.system() == "Windows":
+        return p.chromium.launch(headless=HEADLESS, executable_path=encontrar_chromium())
+    return p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+
+
+def _criar_context(browser):
+    return browser.new_context(
+        accept_downloads=True,
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    )
+
+
+# ─── THREAD DE SESSAO PERSISTENTE ─────────────────────────────────
+#
+# Mantém o navegador aberto entre operações. Faz login uma vez,
+# coleta credenciados, e fica em loop esperando comandos da UI.
+#
+# Comandos (cmd_queue):
+#   ("RODAR_QUITACAO", credenciado, refs_selecionadas)
+#   ("LISTAR_REFS_QUITACAO", credenciado)
+#   ("RODAR_ACOMPANHAMENTO", credenciado, data_ini, data_fim)
+#   ("SAIR",)
+#
+# Eventos (log_queue):
+#   str  → mensagem de status / log
+#   ("CREDENCIADOS", lista)
+#   ("REFERENCIAS", lista)
+#   ("QUITACAO_OK", arquivos)
+#   ("ACOMPANHAMENTO_OK", nome_arq, total)
+#   ("ERRO_LOGIN", msg_amigavel)
+#   ("ERRO_OPERACAO", msg_amigavel)
+#   ("ENCERRADA",)
+
+def sessao_persistente_thread(usuario, senha, api_key, log_queue, cmd_queue):
     try:
+        log_queue.put("Iniciando sessão...")
         with sync_playwright() as p:
             browser = _criar_browser(p)
-            page = _criar_context(browser).new_page()
+            page    = _criar_context(browser).new_page()
 
-            ok = login_com_2captcha(page, usuario, senha, api_key, log_queue)
-            if not ok:
-                raise Exception("Login falhou. Verifique CPF/CNPJ, senha e saldo no 2captcha.")
-
-            log_queue.put("Login realizado! Buscando credenciados disponíveis...")
-            credenciados = obter_credenciados_acompanhamento(page)
-            log_queue.put(f"{len(credenciados)} credenciado(s) encontrado(s).")
-            log_queue.put(("CREDENCIADOS_ACOMP", credenciados))
-
-            # Aguarda o usuário selecionar datas e credenciado
-            filtros = cmd_queue.get()
-            if filtros is None:
+            # ── Login ───────────────────────────────────────────
+            log_queue.put("Autenticando no portal AMHP...")
+            try:
+                ok = login_com_2captcha(page, usuario, senha, api_key, log_queue)
+            except Exception as e:
+                log_queue.put(("ERRO_LOGIN", classificar_erro_login(e)))
                 browser.close()
                 return
 
-            data_ini, data_fim, credenciado = filtros
-            log_queue.put(f"Buscando atendimentos...")
-            dados = buscar_acompanhamento(page, data_ini, data_fim, credenciado, log_queue)
+            if not ok:
+                log_queue.put(("ERRO_LOGIN",
+                    "O login no portal AMHP não foi confirmado. "
+                    "Pode ser CPF/CNPJ ou senha incorretos, ou o site pode estar instável. "
+                    "Verifique seus dados e tente novamente."))
+                browser.close()
+                return
+
+            # ── Coleta de credenciados ──────────────────────────
+            log_queue.put("Login realizado! Buscando credenciados disponíveis...")
+            try:
+                credenciados = obter_credenciados_disponiveis(page, log_queue)
+            except Exception as e:
+                log_queue.put(("ERRO_LOGIN",
+                    f"Login OK, mas não conseguimos carregar a lista de credenciados. "
+                    f"Detalhes: {e}"))
+                browser.close()
+                return
+
+            log_queue.put(f"{len(credenciados)} credenciado(s) encontrado(s).")
+            log_queue.put(("CREDENCIADOS", credenciados))
+
+            # ── Loop de comandos ────────────────────────────────
+            while True:
+                cmd = cmd_queue.get()
+                if cmd is None or (isinstance(cmd, tuple) and cmd and cmd[0] == "SAIR"):
+                    break
+
+                acao = cmd[0]
+
+                try:
+                    if acao == "LISTAR_REFS_QUITACAO":
+                        _, credenciado = cmd
+                        log_queue.put(f"Abrindo Extrato para {credenciado}...")
+                        navegar_para_extrato(page, credenciado, log_queue)
+                        log_queue.put("Buscando referências disponíveis...")
+                        refs = obter_referencias_disponiveis(page)
+                        log_queue.put(f"{len(refs)} referência(s) encontrada(s).")
+                        log_queue.put(("REFERENCIAS", refs))
+
+                    elif acao == "RODAR_QUITACAO":
+                        _, credenciado, selecionadas = cmd
+                        arquivos = []
+                        total = len(selecionadas)
+                        log_queue.put(f"Exportando {total} referência(s)...")
+                        for i, ref in enumerate(selecionadas):
+                            log_queue.put(f"  [{i+1}/{total}] {ref}")
+                            try:
+                                caminho = exportar_csv(page, ref, usuario)
+                                if caminho:
+                                    arquivos.append(caminho)
+                                    log_queue.put(f"  Salvo: {os.path.basename(caminho)}")
+                                time.sleep(2)
+                            except Exception as e:
+                                log_queue.put(f"  Erro em {ref}: {e}")
+
+                        if arquivos:
+                            log_queue.put("Consolidando em Excel...")
+                            excel = consolidar_excel(arquivos, usuario)
+                            arquivos.append(excel)
+                        log_queue.put(("QUITACAO_OK", arquivos))
+
+                    elif acao == "RODAR_ACOMPANHAMENTO":
+                        _, credenciado, data_ini, data_fim = cmd
+                        dados = buscar_acompanhamento(page, data_ini, data_fim, credenciado, log_queue)
+                        if not dados or len(dados) <= 1:
+                            log_queue.put(("ERRO_OPERACAO",
+                                "Nenhum dado encontrado para esse credenciado e período. "
+                                "Verifique as datas e tente novamente."))
+                        else:
+                            nome_arq = salvar_acompanhamento_xlsx(dados, credenciado, data_ini, data_fim)
+                            log_queue.put(("ACOMPANHAMENTO_OK", nome_arq, len(dados) - 1))
+
+                    else:
+                        log_queue.put(f"Comando desconhecido: {acao}")
+
+                except Exception as e:
+                    import traceback
+                    log_queue.put(traceback.format_exc())
+                    log_queue.put(("ERRO_OPERACAO",
+                        f"Houve um erro ao executar essa operação. "
+                        f"A sessão continua ativa — você pode tentar de novo. "
+                        f"Detalhes: {e}"))
+
             browser.close()
-
-        if not dados:
-            raise Exception("Nenhum dado encontrado na tabela.")
-
-        os.makedirs(PASTA_DESTINO, exist_ok=True)
-        credenciado_slug = credenciado[:6].strip().replace(" ", "_")
-        nome_arq = os.path.join(
-            PASTA_DESTINO,
-            f"Acompanhamento_{credenciado_slug}_{data_ini.replace('/', '')}_{data_fim.replace('/', '')}.xlsx",
-        )
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = "Envios Digitais"
-        for row in dados:
-            ws.append(row)
-        # Converte coluna J (índice 9) para número a partir da linha 2
-        for row in ws.iter_rows(min_row=2, min_col=10, max_col=10):
-            for cell in row:
-                if cell.value:
-                    try:
-                        cell.value = float(str(cell.value).replace(",", ".").replace(" ", ""))
-                    except (ValueError, TypeError):
-                        pass
-        for col in ws.columns:
-            max_len = max((len(str(cell.value)) for cell in col if cell.value), default=10)
-            ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 50)
-        wb.save(nome_arq)
-
-        log_queue.put(("CONCLUIDO_ACOMP", nome_arq, len(dados) - 1))
+        log_queue.put(("ENCERRADA",))
 
     except Exception as e:
         import traceback
-        log_queue.put(f"Erro: {e}")
         log_queue.put(traceback.format_exc())
-        log_queue.put(("ERRO_ACOMP", str(e)))
+        log_queue.put(("ERRO_LOGIN", f"Erro fatal na sessão: {e}"))
+
+
+# ─── HELPERS DE UI ────────────────────────────────────────────────
+
+def drenar_log_queue(log_queue, eventos_estruturados, logs_texto):
+    """Lê tudo o que está na fila de log. Separa eventos estruturados (tuplas)
+    de mensagens de texto. Retorna True se algum evento estruturado chegou."""
+    apareceu_evento = False
+    while not log_queue.empty():
+        try:
+            item = log_queue.get_nowait()
+        except queue.Empty:
+            break
+        if isinstance(item, tuple):
+            eventos_estruturados.append(item)
+            apareceu_evento = True
+        else:
+            logs_texto.append(str(item))
+    return apareceu_evento
+
+
+def encerrar_sessao_silenciosa():
+    """Manda o comando de encerrar para a thread, se existir."""
+    cmd_queue = st.session_state.get("cmd_queue")
+    if cmd_queue is not None:
+        try:
+            cmd_queue.put(("SAIR",))
+        except Exception:
+            pass
+
+
+def esvaziar_log_queue():
+    """Descarta mensagens antigas pendentes na fila de log, antes de uma nova operação."""
+    log_queue = st.session_state.get("log_queue")
+    if log_queue is None:
+        return
+    while not log_queue.empty():
+        try:
+            log_queue.get_nowait()
+        except queue.Empty:
+            break
+
+
+def resetar_sessao():
+    """Limpa todo o estado da sessão (após sair ou erro fatal)."""
+    encerrar_sessao_silenciosa()
+    for k in ["step", "usuario", "senha", "log_queue", "cmd_queue", "browser_thread",
+              "credenciados", "credenciado_atual", "referencias", "selecionadas",
+              "arquivos_quitacao", "acomp_arquivo", "acomp_total",
+              "logs_acumulados", "fluxo_atual"]:
+        st.session_state.pop(k, None)
+    st.session_state.step = "input"
 
 
 # ─── INTERFACE STREAMLIT ──────────────────────────────────────────
@@ -524,7 +657,7 @@ st.markdown("""
     .block-container {
         padding-top: 1.5rem;
         padding-bottom: 1rem;
-        max-width: 520px;
+        max-width: 560px;
     }
 
     [data-testid="stForm"] {
@@ -544,9 +677,16 @@ st.markdown("""
         font-size: 1rem !important;
         transition: background 0.2s !important;
     }
-
     .stButton > button:hover {
         background-color: #4A90C4 !important;
+    }
+    .stButton.secundario > button {
+        background-color: #FFFFFF !important;
+        color: #0E1F3B !important;
+        border: 1.5px solid #c5d8ea !important;
+    }
+    .stButton.secundario > button:hover {
+        background-color: #f0f4fa !important;
     }
 
     .stTextInput > div > div > input {
@@ -559,6 +699,16 @@ st.markdown("""
         color: #D6E4F0 !important;
         border-radius: 8px !important;
         font-size: 0.82rem !important;
+    }
+
+    .sessao-ativa {
+        background-color: #e8f4fc;
+        border-left: 3px solid #4A90C4;
+        padding: 0.5rem 0.75rem;
+        border-radius: 4px;
+        font-size: 0.82rem;
+        color: #0E1F3B;
+        margin-bottom: 1rem;
     }
 
     .dev-footer {
@@ -590,408 +740,543 @@ st.markdown(
 api_key = carregar_api_key()
 
 # Inicializa session_state
-for _k, _v in [
-    ("step", "input"), ("referencias", []), ("usuario", ""), ("senha", ""),
-    ("selecionadas", []), ("arquivos_finais", []),
-    ("acomp_step", "input"), ("acomp_arquivo", None), ("acomp_total", 0),
-    ("acomp_credenciados", []),
-    ("relatorio", "quitacoes"),
-]:
-    if _k not in st.session_state:
-        st.session_state[_k] = _v
+DEFAULTS = {
+    "step": "input",
+    "usuario": "",
+    "senha": "",
+    "credenciados": [],
+    "credenciado_atual": None,
+    "referencias": [],
+    "selecionadas": [],
+    "arquivos_quitacao": [],
+    "acomp_arquivo": None,
+    "acomp_total": 0,
+    "logs_acumulados": [],
+    "fluxo_atual": None,  # 'quitacao' ou 'acompanhamento'
+    "erro": None,
+}
+for k, v in DEFAULTS.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
-extrato_em_progresso = st.session_state.step != "input"
-acomp_em_progresso   = st.session_state.acomp_step != "input"
 
-# ──────────────────────────────────────────────────────────────────
-# Fluxo: Relatório de Quitações
-# ──────────────────────────────────────────────────────────────────
-if extrato_em_progresso:
-
-    # ── Etapa 2: aguardando referências ──────────────────────────
-    if st.session_state.step == "buscando":
-        log_queue  = st.session_state.log_queue
-        thread     = st.session_state.browser_thread
-        ESTIMATIVA = 55
-
-        st.markdown("**Buscando referências disponíveis...**")
-        progress_bar       = st.progress(0.0)
-        col_timer, col_est = st.columns([1, 3])
-        timer_ph           = col_timer.empty()
-        col_est.caption(f"Tempo estimado: ~{ESTIMATIVA}s")
-        status_ph          = st.empty()
-        logs, refs, erro   = [], None, None
-        start_time         = time.time()
-
-        while refs is None and erro is None:
-            elapsed  = time.time() - start_time
-            progress_bar.progress(min(elapsed / ESTIMATIVA, 0.95))
-            timer_ph.metric("⏱", f"{int(elapsed)}s")
-
-            while not log_queue.empty():
-                item = log_queue.get_nowait()
-                if isinstance(item, tuple) and item[0] == "REFERENCIAS":
-                    refs = item[1]
-                elif isinstance(item, tuple) and item[0] == "ERRO":
-                    erro = item[1]
-                else:
-                    logs.append(str(item))
-                    status_ph.info(logs[-1])
-
-            if refs is None and erro is None:
-                if not thread.is_alive():
-                    erro = "Sessão encerrada inesperadamente."
-                    break
-                time.sleep(0.2)
-
-        if refs is not None:
-            progress_bar.progress(1.0)
-
-        if erro:
-            st.session_state.cmd_queue.put(None)
-            st.session_state.erro = erro
-            st.session_state.step = "input"
-        else:
-            st.session_state.referencias = refs
-            st.session_state.step = "select"
-        st.rerun()
-
-    # ── Etapa 3: seleção de referências ──────────────────────────
-    elif st.session_state.step == "select":
-        st.markdown(f"**{len(st.session_state.referencias)} referência(s) disponível(is)**")
-
-        selecionadas = st.multiselect(
-            "Selecione as referências para exportar:",
-            options=st.session_state.referencias,
-            default=st.session_state.referencias[:1] if st.session_state.referencias else [],
+def banner_sessao_ativa():
+    """Mostra um banner indicando que há uma sessão ativa no navegador."""
+    cred = st.session_state.get("credenciado_atual")
+    if cred:
+        st.markdown(
+            f"<div class='sessao-ativa'>🟢 <b>Sessão ativa</b> — {cred}<br>"
+            "<small>Não feche esta aba até concluir. Use 'Sair' para encerrar a sessão.</small></div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            "<div class='sessao-ativa'>🟢 <b>Sessão ativa</b><br>"
+            "<small>Não feche esta aba até concluir.</small></div>",
+            unsafe_allow_html=True,
         )
 
-        col1, col2 = st.columns(2)
-        with col1:
-            if st.button("← Voltar", use_container_width=True):
-                st.session_state.cmd_queue.put(None)
-                st.session_state.step = "input"
-                st.rerun()
-        with col2:
-            exportar = st.button("Exportar Selecionados →", use_container_width=True)
 
-        if exportar:
+# ──────────────────────────────────────────────────────────────────
+# TELA: Login (formulário)
+# ──────────────────────────────────────────────────────────────────
+if st.session_state.step == "input":
+    if st.session_state.get("erro"):
+        st.error(st.session_state.pop("erro"))
+
+    if not api_key:
+        st.error("Chave 2captcha não configurada. Defina a variável de ambiente ANTICAPTCHA_KEY.")
+    else:
+        with st.form("login_form"):
+            usuario = st.text_input("CPF/CNPJ")
+            senha   = st.text_input("Senha", type="password")
+            entrar  = st.form_submit_button("Entrar", use_container_width=True)
+
+        if entrar:
+            if not usuario or not senha:
+                st.error("Preencha CPF/CNPJ e Senha.")
+            else:
+                st.session_state.usuario   = usuario
+                st.session_state.senha     = senha
+                st.session_state.log_queue = queue.Queue()
+                st.session_state.cmd_queue = queue.Queue()
+                t = threading.Thread(
+                    target=sessao_persistente_thread,
+                    args=(usuario, senha, api_key,
+                          st.session_state.log_queue, st.session_state.cmd_queue),
+                    daemon=True,
+                )
+                t.start()
+                st.session_state.browser_thread = t
+                st.session_state.step = "logando"
+                st.session_state.logs_acumulados = []
+                st.rerun()
+
+
+# ──────────────────────────────────────────────────────────────────
+# TELA: Autenticando + buscando credenciados
+# ──────────────────────────────────────────────────────────────────
+elif st.session_state.step == "logando":
+    log_queue  = st.session_state.log_queue
+    thread     = st.session_state.browser_thread
+    ESTIMATIVA = 55  # segundos
+
+    st.markdown("**Conectando à AMHP...**")
+
+    progress_bar = st.progress(0.0)
+    col_t, col_m = st.columns([1, 3])
+    timer_ph     = col_t.empty()
+    msg_ph       = col_m.empty()
+    status_ph    = st.empty()
+
+    # Botão cancelar
+    col_a, col_b = st.columns([3, 1])
+    with col_b:
+        if st.button("Cancelar", use_container_width=True, key="cancelar_login"):
+            resetar_sessao()
+            st.rerun()
+
+    start_time   = time.time()
+    eventos, logs = [], st.session_state.logs_acumulados
+
+    credenciados, erro = None, None
+
+    while credenciados is None and erro is None:
+        elapsed = time.time() - start_time
+        progress_bar.progress(min(elapsed / ESTIMATIVA, 0.95))
+        timer_ph.metric("⏱", f"{int(elapsed)}s")
+
+        if elapsed < ESTIMATIVA:
+            msg_ph.caption(f"Tempo estimado: ~{ESTIMATIVA}s")
+        else:
+            msg_ph.caption("⚠️ Tá demorando mais que o normal — o site da AMHP pode estar lento.")
+
+        drenar_log_queue(log_queue, eventos, logs)
+
+        for ev in eventos:
+            if ev[0] == "CREDENCIADOS":
+                credenciados = ev[1]
+            elif ev[0] == "ERRO_LOGIN":
+                erro = ev[1]
+        eventos.clear()
+
+        if logs:
+            status_ph.info(logs[-1])
+
+        if credenciados is None and erro is None:
+            if not thread.is_alive():
+                erro = "A sessão encerrou inesperadamente. Tente novamente."
+                break
+            time.sleep(0.2)
+
+    progress_bar.progress(1.0)
+
+    if erro:
+        resetar_sessao()
+        st.session_state.erro = erro
+        st.rerun()
+    else:
+        st.session_state.credenciados = credenciados
+        # Se só tem 1 credenciado, pula a tela de seleção
+        if len(credenciados) == 1:
+            st.session_state.credenciado_atual = credenciados[0]
+            st.session_state.step = "menu"
+        else:
+            st.session_state.step = "escolher_credenciado"
+        st.rerun()
+
+
+# ──────────────────────────────────────────────────────────────────
+# TELA: Escolher credenciado
+# ──────────────────────────────────────────────────────────────────
+elif st.session_state.step == "escolher_credenciado":
+    st.markdown(f"**{len(st.session_state.credenciados)} credenciado(s) disponível(is)**")
+    st.caption("Escolha o credenciado para o qual você quer gerar relatórios.")
+
+    escolha = st.radio(
+        "Credenciado:",
+        options=st.session_state.credenciados,
+        index=0,
+        label_visibility="collapsed",
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown('<div class="stButton secundario">', unsafe_allow_html=True)
+        if st.button("Sair", use_container_width=True, key="sair_cred"):
+            resetar_sessao()
+            st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+    with col2:
+        if st.button("Continuar →", use_container_width=True, key="cont_cred"):
+            st.session_state.credenciado_atual = escolha
+            st.session_state.step = "menu"
+            st.rerun()
+
+
+# ──────────────────────────────────────────────────────────────────
+# TELA: Menu principal
+# ──────────────────────────────────────────────────────────────────
+elif st.session_state.step == "menu":
+    banner_sessao_ativa()
+
+    if st.session_state.get("erro"):
+        st.error(st.session_state.pop("erro"))
+
+    st.markdown("**O que você quer fazer?**")
+
+    if st.button("📄 Relatório de Quitações", use_container_width=True, key="btn_quit"):
+        st.session_state.fluxo_atual = "quitacao"
+        st.session_state.step = "quitacao_listando"
+        st.session_state.logs_acumulados = []
+        esvaziar_log_queue()
+        st.session_state.cmd_queue.put(("LISTAR_REFS_QUITACAO", st.session_state.credenciado_atual))
+        st.rerun()
+
+    if st.button("📋 Acompanhamento de Envios Digitais", use_container_width=True, key="btn_acomp"):
+        st.session_state.fluxo_atual = "acompanhamento"
+        st.session_state.step = "acomp_filtros"
+        st.rerun()
+
+    st.markdown("---")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown('<div class="stButton secundario">', unsafe_allow_html=True)
+        if len(st.session_state.credenciados) > 1:
+            if st.button("↺ Trocar credenciado", use_container_width=True, key="btn_trocar"):
+                st.session_state.step = "escolher_credenciado"
+                st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+    with col2:
+        st.markdown('<div class="stButton secundario">', unsafe_allow_html=True)
+        if st.button("⎋ Encerrar sessão", use_container_width=True, key="btn_sair_menu"):
+            resetar_sessao()
+            st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+
+
+# ──────────────────────────────────────────────────────────────────
+# TELA: Quitação — buscando referências
+# ──────────────────────────────────────────────────────────────────
+elif st.session_state.step == "quitacao_listando":
+    banner_sessao_ativa()
+    log_queue = st.session_state.log_queue
+    thread    = st.session_state.browser_thread
+    ESTIMATIVA = 20
+
+    st.markdown("**Buscando referências disponíveis...**")
+    progress_bar = st.progress(0.0)
+    col_t, col_m = st.columns([1, 3])
+    timer_ph     = col_t.empty()
+    msg_ph       = col_m.empty()
+    status_ph    = st.empty()
+
+    start_time = time.time()
+    eventos    = []
+    logs       = st.session_state.logs_acumulados
+
+    refs, erro = None, None
+    while refs is None and erro is None:
+        elapsed = time.time() - start_time
+        progress_bar.progress(min(elapsed / ESTIMATIVA, 0.95))
+        timer_ph.metric("⏱", f"{int(elapsed)}s")
+        if elapsed < ESTIMATIVA:
+            msg_ph.caption(f"Tempo estimado: ~{ESTIMATIVA}s")
+        else:
+            msg_ph.caption("⚠️ Tá demorando mais que o normal...")
+
+        drenar_log_queue(log_queue, eventos, logs)
+        for ev in eventos:
+            if ev[0] == "REFERENCIAS":
+                refs = ev[1]
+            elif ev[0] == "ERRO_OPERACAO":
+                erro = ev[1]
+            elif ev[0] == "ERRO_LOGIN":
+                erro = ev[1]
+        eventos.clear()
+
+        if logs:
+            status_ph.info(logs[-1])
+
+        if refs is None and erro is None:
+            if not thread.is_alive():
+                erro = "A sessão encerrou inesperadamente."
+                break
+            time.sleep(0.2)
+
+    progress_bar.progress(1.0)
+
+    if erro:
+        st.session_state.erro = erro
+        st.session_state.step = "menu"
+        st.rerun()
+    else:
+        st.session_state.referencias = refs
+        st.session_state.step = "quitacao_selecionar"
+        st.rerun()
+
+
+# ──────────────────────────────────────────────────────────────────
+# TELA: Quitação — selecionar referências
+# ──────────────────────────────────────────────────────────────────
+elif st.session_state.step == "quitacao_selecionar":
+    banner_sessao_ativa()
+    st.markdown(f"**{len(st.session_state.referencias)} referência(s) disponível(is)**")
+
+    selecionadas = st.multiselect(
+        "Selecione as referências para exportar:",
+        options=st.session_state.referencias,
+        default=st.session_state.referencias[:1] if st.session_state.referencias else [],
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown('<div class="stButton secundario">', unsafe_allow_html=True)
+        if st.button("← Voltar ao menu", use_container_width=True, key="voltar_quit_sel"):
+            st.session_state.step = "menu"
+            st.rerun()
+        st.markdown('</div>', unsafe_allow_html=True)
+    with col2:
+        if st.button("Exportar selecionados →", use_container_width=True, key="exp_quit"):
             if not selecionadas:
                 st.error("Selecione ao menos uma referência.")
             else:
                 st.session_state.selecionadas = selecionadas
-                st.session_state.cmd_queue.put(selecionadas)
-                st.session_state.step = "exportando"
+                st.session_state.logs_acumulados = []
+                esvaziar_log_queue()
+                st.session_state.cmd_queue.put(
+                    ("RODAR_QUITACAO", st.session_state.credenciado_atual, selecionadas)
+                )
+                st.session_state.step = "quitacao_exportando"
                 st.rerun()
 
-    # ── Etapa 4: exportando ───────────────────────────────────────
-    elif st.session_state.step == "exportando":
-        log_queue  = st.session_state.log_queue
-        thread     = st.session_state.browser_thread
-        total_refs = len(st.session_state.selecionadas)
-
-        st.markdown(f"**Exportando {total_refs} referência(s)...**")
-        progress_bar  = st.progress(0.0)
-        timer_ph      = st.empty()
-        log_ph        = st.empty()
-        logs, arquivos_finais, erro = [], [], None
-        start_time    = time.time()
-        current_ref   = 0
-
-        while thread.is_alive() or not log_queue.empty():
-            elapsed = time.time() - start_time
-            timer_ph.caption(f"⏱ {int(elapsed)}s")
-
-            while not log_queue.empty():
-                item = log_queue.get_nowait()
-                if isinstance(item, tuple) and item[0] == "CONCLUIDO":
-                    arquivos_finais = item[1]
-                elif isinstance(item, tuple) and item[0] == "ERRO":
-                    erro = item[1]
-                else:
-                    msg = str(item)
-                    m = re.search(r'\[(\d+)/\d+\]', msg)
-                    if m:
-                        current_ref = int(m.group(1))
-                        progress_bar.progress((current_ref - 0.5) / total_refs)
-                    logs.append(msg)
-                    log_ph.code("\n".join(logs))
-            time.sleep(0.2)
-
-        progress_bar.progress(1.0)
-        st.session_state.arquivos_finais = arquivos_finais
-        if erro:
-            st.session_state.erro = erro
-        st.session_state.step = "done"
-        st.rerun()
-
-    # ── Etapa 5: download ─────────────────────────────────────────
-    elif st.session_state.step == "done":
-        if st.session_state.get("erro"):
-            st.error(st.session_state.pop("erro"))
-
-        arquivos_finais = st.session_state.arquivos_finais
-        csvs  = [f for f in arquivos_finais if f.endswith(".csv")]
-        excel = next((f for f in arquivos_finais if f.endswith(".xlsx")), None)
-
-        if arquivos_finais:
-            st.success(f"Concluído! {len(csvs)} arquivo(s) exportado(s).")
-            st.info("Obrigado por utilizar nosso sistema! — Equipe B4")
-            st.subheader("Baixar arquivos")
-            for arq in csvs:
-                with open(arq, "rb") as f:
-                    st.download_button(
-                        label=f"Baixar {os.path.basename(arq)}",
-                        data=f.read(),
-                        file_name=os.path.basename(arq),
-                        mime="text/csv",
-                    )
-            if excel and os.path.exists(excel):
-                with open(excel, "rb") as f:
-                    st.download_button(
-                        label=f"Baixar {os.path.basename(excel)} (consolidado)",
-                        data=f.read(),
-                        file_name=os.path.basename(excel),
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
-        else:
-            st.warning("Nenhum arquivo exportado. Verifique suas credenciais e tente novamente.")
-            if os.path.exists("/tmp/amhp_debug.png"):
-                with open("/tmp/amhp_debug.png", "rb") as f:
-                    st.image(f.read(), caption="Estado da página ao falhar")
-
-        st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("Nova Exportação", use_container_width=True):
-            for _k in ["step", "referencias", "usuario", "senha", "selecionadas",
-                       "arquivos_finais", "log_queue", "cmd_queue", "browser_thread"]:
-                st.session_state.pop(_k, None)
-            st.rerun()
 
 # ──────────────────────────────────────────────────────────────────
-# Fluxo: Acompanhamento de Envios Digitais
+# TELA: Quitação — exportando
 # ──────────────────────────────────────────────────────────────────
-elif acomp_em_progresso:
+elif st.session_state.step == "quitacao_exportando":
+    banner_sessao_ativa()
+    log_queue = st.session_state.log_queue
+    thread    = st.session_state.browser_thread
+    total_refs = len(st.session_state.selecionadas)
 
-    # ── Etapa 2: aguardando credenciados ─────────────────────────
-    if st.session_state.acomp_step == "buscando":
-        log_queue  = st.session_state.acomp_log_queue
-        thread     = st.session_state.acomp_thread
-        ESTIMATIVA = 25
+    st.markdown(f"**Exportando {total_refs} referência(s)...**")
+    progress_bar = st.progress(0.0)
+    timer_ph     = st.empty()
+    log_ph       = st.empty()
 
-        st.markdown("**Autenticando...**")
-        progress_bar       = st.progress(0.0)
-        col_timer, col_est = st.columns([1, 3])
-        timer_ph           = col_timer.empty()
-        col_est.caption(f"Tempo estimado: ~{ESTIMATIVA}s")
-        status_ph          = st.empty()
-        logs, credenciados, erro = [], None, None
-        start_time         = time.time()
+    start_time   = time.time()
+    eventos      = []
+    logs         = st.session_state.logs_acumulados
+    arquivos     = None
+    erro         = None
+    current_ref  = 0
 
-        while credenciados is None and erro is None:
-            elapsed = time.time() - start_time
-            progress_bar.progress(min(elapsed / ESTIMATIVA, 0.95))
-            timer_ph.metric("⏱", f"{int(elapsed)}s")
+    while arquivos is None and erro is None:
+        elapsed = time.time() - start_time
+        timer_ph.caption(f"⏱ {int(elapsed)}s")
 
-            while not log_queue.empty():
-                item = log_queue.get_nowait()
-                if isinstance(item, tuple) and item[0] == "CREDENCIADOS_ACOMP":
-                    credenciados = item[1]
-                elif isinstance(item, tuple) and item[0] == "ERRO_ACOMP":
-                    erro = item[1]
-                else:
-                    logs.append(str(item))
-                    status_ph.info(logs[-1])
+        drenar_log_queue(log_queue, eventos, logs)
+        for ev in eventos:
+            if ev[0] == "QUITACAO_OK":
+                arquivos = ev[1]
+            elif ev[0] in ("ERRO_OPERACAO", "ERRO_LOGIN"):
+                erro = ev[1]
+        eventos.clear()
 
-            if credenciados is None and erro is None:
-                if not thread.is_alive():
-                    erro = "Sessão encerrada inesperadamente."
-                    break
-                time.sleep(0.2)
+        for msg in logs[-10:]:
+            m = re.search(r'\[(\d+)/\d+\]', msg)
+            if m:
+                current_ref = int(m.group(1))
+                progress_bar.progress((current_ref - 0.5) / total_refs)
+        if logs:
+            log_ph.code("\n".join(logs[-15:]))
 
-        progress_bar.progress(1.0)
+        if arquivos is None and erro is None:
+            if not thread.is_alive():
+                erro = "A sessão encerrou inesperadamente."
+                break
+            time.sleep(0.3)
 
-        if erro:
-            st.session_state.acomp_cmd_queue.put(None)
-            st.session_state.acomp_erro = erro
-            st.session_state.acomp_step = "input"
-        else:
-            st.session_state.acomp_credenciados = credenciados
-            st.session_state.acomp_step = "select_filters"
+    progress_bar.progress(1.0)
+
+    if erro:
+        st.session_state.erro = erro
+        st.session_state.step = "menu"
+    else:
+        st.session_state.arquivos_quitacao = arquivos
+        st.session_state.step = "quitacao_done"
+    st.rerun()
+
+
+# ──────────────────────────────────────────────────────────────────
+# TELA: Quitação — download
+# ──────────────────────────────────────────────────────────────────
+elif st.session_state.step == "quitacao_done":
+    banner_sessao_ativa()
+    arquivos = st.session_state.arquivos_quitacao
+    csvs  = [f for f in arquivos if f.endswith(".csv")]
+    excel = next((f for f in arquivos if f.endswith(".xlsx")), None)
+
+    if arquivos:
+        st.success(f"Concluído! {len(csvs)} arquivo(s) exportado(s).")
+        st.subheader("Baixar arquivos")
+        for arq in csvs:
+            with open(arq, "rb") as f:
+                st.download_button(
+                    label=f"⬇️ {os.path.basename(arq)}",
+                    data=f.read(),
+                    file_name=os.path.basename(arq),
+                    mime="text/csv",
+                    key=f"dl_{os.path.basename(arq)}",
+                )
+        if excel and os.path.exists(excel):
+            with open(excel, "rb") as f:
+                st.download_button(
+                    label=f"⬇️ {os.path.basename(excel)} (consolidado)",
+                    data=f.read(),
+                    file_name=os.path.basename(excel),
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"dl_excel",
+                )
+    else:
+        st.warning("Nenhum arquivo exportado.")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    if st.button("← Voltar ao menu", use_container_width=True, key="voltar_quit_done"):
+        st.session_state.arquivos_quitacao = []
+        st.session_state.step = "menu"
         st.rerun()
 
-    # ── Etapa 3: seleção de filtros ───────────────────────────────
-    elif st.session_state.acomp_step == "select_filters":
-        credenciados = st.session_state.acomp_credenciados
-        st.markdown(f"**{len(credenciados)} credenciado(s) disponível(is)**")
 
-        with st.form("acomp_filtros_form"):
-            col_ini, col_fim = st.columns(2)
-            with col_ini:
-                data_ini_dt = st.date_input("Data Início", format="DD/MM/YYYY")
-            with col_fim:
-                data_fim_dt = st.date_input("Data Fim", format="DD/MM/YYYY")
-            credenciado = st.selectbox("Credenciado", credenciados)
-            buscar = st.form_submit_button("Buscar Atendimentos", use_container_width=True)
+# ──────────────────────────────────────────────────────────────────
+# TELA: Acompanhamento — filtros (datas)
+# ──────────────────────────────────────────────────────────────────
+elif st.session_state.step == "acomp_filtros":
+    banner_sessao_ativa()
+    st.markdown("**Acompanhamento de Envios Digitais**")
+    st.caption(f"Credenciado: {st.session_state.credenciado_atual}")
 
-        if st.button("← Voltar", use_container_width=True):
-            st.session_state.acomp_cmd_queue.put(None)
-            st.session_state.acomp_step = "input"
-            st.rerun()
+    with st.form("acomp_filtros_form"):
+        col_ini, col_fim = st.columns(2)
+        with col_ini:
+            data_ini_dt = st.date_input("Data Início", format="DD/MM/YYYY", value=date.today())
+        with col_fim:
+            data_fim_dt = st.date_input("Data Fim", format="DD/MM/YYYY", value=date.today())
+        buscar = st.form_submit_button("Buscar Atendimentos", use_container_width=True)
 
-        if buscar:
+    st.markdown('<div class="stButton secundario">', unsafe_allow_html=True)
+    if st.button("← Voltar ao menu", use_container_width=True, key="voltar_acomp_filtros"):
+        st.session_state.step = "menu"
+        st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    if buscar:
+        if data_ini_dt > data_fim_dt:
+            st.error("A Data Início não pode ser depois da Data Fim. Verifique e tente de novo.")
+        else:
             data_ini = data_ini_dt.strftime("%d/%m/%Y")
             data_fim = data_fim_dt.strftime("%d/%m/%Y")
-            st.session_state.acomp_cmd_queue.put((data_ini, data_fim, credenciado))
-            st.session_state.acomp_step = "processando"
+            st.session_state.logs_acumulados = []
+            esvaziar_log_queue()
+            st.session_state.cmd_queue.put(
+                ("RODAR_ACOMPANHAMENTO", st.session_state.credenciado_atual, data_ini, data_fim)
+            )
+            st.session_state.step = "acomp_buscando"
             st.rerun()
 
-    # ── Etapa 4: processando ──────────────────────────────────────
-    elif st.session_state.acomp_step == "processando":
-        log_queue  = st.session_state.acomp_log_queue
-        thread     = st.session_state.acomp_thread
-        ESTIMATIVA = 30
 
-        st.markdown("**Buscando atendimentos...**")
-        progress_bar       = st.progress(0.0)
-        col_timer, col_est = st.columns([1, 3])
-        timer_ph           = col_timer.empty()
-        col_est.caption(f"Tempo estimado: ~{ESTIMATIVA}s")
-        log_ph             = st.empty()
-        logs, resultado, erro = [], None, None
-        start_time         = time.time()
+# ──────────────────────────────────────────────────────────────────
+# TELA: Acompanhamento — buscando
+# ──────────────────────────────────────────────────────────────────
+elif st.session_state.step == "acomp_buscando":
+    banner_sessao_ativa()
+    log_queue  = st.session_state.log_queue
+    thread     = st.session_state.browser_thread
+    ESTIMATIVA = 30
 
-        while resultado is None and erro is None:
-            elapsed = time.time() - start_time
-            progress_bar.progress(min(elapsed / ESTIMATIVA, 0.95))
-            timer_ph.metric("⏱", f"{int(elapsed)}s")
+    st.markdown("**Buscando atendimentos...**")
+    progress_bar = st.progress(0.0)
+    col_t, col_m = st.columns([1, 3])
+    timer_ph     = col_t.empty()
+    msg_ph       = col_m.empty()
+    log_ph       = st.empty()
 
-            while not log_queue.empty():
-                item = log_queue.get_nowait()
-                if isinstance(item, tuple) and item[0] == "CONCLUIDO_ACOMP":
-                    resultado = item
-                elif isinstance(item, tuple) and item[0] == "ERRO_ACOMP":
-                    erro = item[1]
-                else:
-                    logs.append(str(item))
-                    log_ph.info(logs[-1])
+    start_time = time.time()
+    eventos    = []
+    logs       = st.session_state.logs_acumulados
+    resultado, erro = None, None
 
-            if resultado is None and erro is None:
-                if not thread.is_alive():
-                    erro = "Processo encerrado inesperadamente."
-                    break
-                time.sleep(0.2)
-
-        progress_bar.progress(1.0)
-
-        if erro:
-            st.session_state.acomp_erro = erro
-            st.session_state.acomp_step = "input"
+    while resultado is None and erro is None:
+        elapsed = time.time() - start_time
+        progress_bar.progress(min(elapsed / ESTIMATIVA, 0.95))
+        timer_ph.metric("⏱", f"{int(elapsed)}s")
+        if elapsed < ESTIMATIVA:
+            msg_ph.caption(f"Tempo estimado: ~{ESTIMATIVA}s")
         else:
-            _, nome_arq, total = resultado
-            st.session_state.acomp_arquivo = nome_arq
-            st.session_state.acomp_total   = total
-            st.session_state.acomp_step    = "done"
+            msg_ph.caption("⚠️ Tá demorando mais que o normal...")
+
+        drenar_log_queue(log_queue, eventos, logs)
+        for ev in eventos:
+            if ev[0] == "ACOMPANHAMENTO_OK":
+                resultado = ev
+            elif ev[0] in ("ERRO_OPERACAO", "ERRO_LOGIN"):
+                erro = ev[1]
+        eventos.clear()
+
+        if logs:
+            log_ph.info(logs[-1])
+
+        if resultado is None and erro is None:
+            if not thread.is_alive():
+                erro = "A sessão encerrou inesperadamente."
+                break
+            time.sleep(0.3)
+
+    progress_bar.progress(1.0)
+
+    if erro:
+        st.session_state.erro = erro
+        st.session_state.step = "menu"
+    else:
+        _, nome_arq, total = resultado
+        st.session_state.acomp_arquivo = nome_arq
+        st.session_state.acomp_total   = total
+        st.session_state.step          = "acomp_done"
+    st.rerun()
+
+
+# ──────────────────────────────────────────────────────────────────
+# TELA: Acompanhamento — download
+# ──────────────────────────────────────────────────────────────────
+elif st.session_state.step == "acomp_done":
+    banner_sessao_ativa()
+    nome_arq = st.session_state.acomp_arquivo
+    total    = st.session_state.acomp_total
+
+    st.success(f"Concluído! {total} linha(s) encontrada(s).")
+    if nome_arq and os.path.exists(nome_arq):
+        with open(nome_arq, "rb") as f:
+            st.download_button(
+                label=f"⬇️ {os.path.basename(nome_arq)}",
+                data=f.read(),
+                file_name=os.path.basename(nome_arq),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_acomp",
+            )
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    if st.button("← Voltar ao menu", use_container_width=True, key="voltar_acomp_done"):
+        st.session_state.acomp_arquivo = None
+        st.session_state.acomp_total   = 0
+        st.session_state.step          = "menu"
         st.rerun()
 
-    # ── Etapa 5: download ─────────────────────────────────────────
-    elif st.session_state.acomp_step == "done":
-        nome_arq = st.session_state.acomp_arquivo
-        total    = st.session_state.acomp_total
-
-        st.success(f"Concluído! {total} linha(s) encontrada(s).")
-        st.info("Obrigado por usar o sistema AMHPDF. Bom trabalho!")
-        if nome_arq and os.path.exists(nome_arq):
-            with open(nome_arq, "rb") as f:
-                st.download_button(
-                    label=f"Baixar {os.path.basename(nome_arq)}",
-                    data=f.read(),
-                    file_name=os.path.basename(nome_arq),
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                )
-
-        st.markdown("<br>", unsafe_allow_html=True)
-        if st.button("Nova Busca", use_container_width=True):
-            for _k in ["acomp_step", "acomp_arquivo", "acomp_total", "acomp_credenciados",
-                       "acomp_log_queue", "acomp_cmd_queue", "acomp_thread"]:
-                st.session_state.pop(_k, None)
-            st.rerun()
 
 # ──────────────────────────────────────────────────────────────────
-# Tela inicial: seletor + formulário
+# Rodapé
 # ──────────────────────────────────────────────────────────────────
-else:
-    st.selectbox(
-        "Selecione o relatório:",
-        options=["quitacoes", "acompanhamento"],
-        format_func=lambda x: "📄 Relatório de Quitações" if x == "quitacoes" else "📋 Acompanhamento de Envios Digitais",
-        key="relatorio",
-    )
-    st.markdown("---")
-
-    # ── Formulário: Relatório de Quitações ───────────────────────
-    if st.session_state.relatorio == "quitacoes":
-        if st.session_state.get("erro"):
-            st.error(st.session_state.pop("erro"))
-
-        if not api_key:
-            st.error("Chave 2captcha nao configurada. Defina a variavel de ambiente ANTICAPTCHA_KEY.")
-        else:
-            with st.form("credentials_form"):
-                usuario = st.text_input("CPF/CNPJ")
-                senha   = st.text_input("Senha", type="password")
-                buscar  = st.form_submit_button("Entrar", use_container_width=True)
-
-            if buscar:
-                if not usuario or not senha:
-                    st.error("Preencha CPF/CNPJ e Senha.")
-                else:
-                    st.session_state.usuario   = usuario
-                    st.session_state.senha     = senha
-                    st.session_state.log_queue = queue.Queue()
-                    st.session_state.cmd_queue = queue.Queue()
-                    t = threading.Thread(
-                        target=sessao_unica_thread,
-                        args=(usuario, senha, api_key,
-                              st.session_state.log_queue, st.session_state.cmd_queue),
-                        daemon=True,
-                    )
-                    t.start()
-                    st.session_state.browser_thread = t
-                    st.session_state.step = "buscando"
-                    st.rerun()
-
-    # ── Formulário: Acompanhamento de Envios Digitais ─────────────
-    else:
-        if st.session_state.get("acomp_erro"):
-            st.error(st.session_state.pop("acomp_erro"))
-
-        if not api_key:
-            st.error("Chave 2captcha nao configurada. Defina a variavel de ambiente ANTICAPTCHA_KEY.")
-        else:
-            with st.form("acomp_form"):
-                acomp_usuario = st.text_input("CPF/CNPJ")
-                acomp_senha   = st.text_input("Senha", type="password")
-                acomp_buscar  = st.form_submit_button("Entrar", use_container_width=True)
-
-            if acomp_buscar:
-                if not acomp_usuario or not acomp_senha:
-                    st.error("Preencha CPF/CNPJ e Senha.")
-                else:
-                    st.session_state.acomp_log_queue = queue.Queue()
-                    st.session_state.acomp_cmd_queue = queue.Queue()
-                    t = threading.Thread(
-                        target=acompanhamento_thread,
-                        args=(acomp_usuario, acomp_senha, api_key,
-                              st.session_state.acomp_log_queue,
-                              st.session_state.acomp_cmd_queue),
-                        daemon=True,
-                    )
-                    t.start()
-                    st.session_state.acomp_thread = t
-                    st.session_state.acomp_step = "buscando"
-                    st.rerun()
-
-# ── Rodapé ────────────────────────────────────────────────────────
 if os.path.exists("logo_b4strategy.png"):
     with open("logo_b4strategy.png", "rb") as f:
         logo_b64 = base64.b64encode(f.read()).decode()
