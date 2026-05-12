@@ -365,29 +365,37 @@ def sessao_unica_thread(usuario, senha, api_key, log_queue, cmd_queue):
         log_queue.put(("ERRO", str(e)))
 
 
-# ─── CONSTANTES ACOMPANHAMENTO ────────────────────────────────────
+# ─── ACOMPANHAMENTO ENVIOS DIGITAIS ───────────────────────────────
 
-CREDENCIADOS = [
-    "018375 - Instituto de Psiquiatria DF Ltda.",
-    "010357 - Comenth Assistência e Consultoria em Saude Ltda.",
-    "013520 - Mind Clínica Médica Ltda. Me",
-]
-
-URL_AMHPTISS_LOGIN = "https://amhptiss.amhp.com.br/"
 URL_ACOMPANHAMENTO = "https://amhptiss.amhp.com.br/AcompanhamentoAtendimentoDigital.aspx"
 
 
-# ─── ACOMPANHAMENTO ENVIOS DIGITAIS ───────────────────────────────
+def obter_credenciados_acompanhamento(page):
+    # Estabelece sessão no amhptiss (mesmo SSO do extrato)
+    try:
+        page.wait_for_selector("text=AMHPTISS", timeout=8000)
+        page.get_by_text("AMHPTISS", exact=False).first.click()
+        page.wait_for_load_state("load")
+    except Exception:
+        pass
 
-def login_amhptiss_direto(page, usuario, senha, log_queue):
-    log_queue.put("Acessando portal AMHPTISS...")
-    page.goto(URL_AMHPTISS_LOGIN)
-    page.wait_for_load_state("networkidle")
-    page.fill("#ctl00_MainContent_txtLogin", usuario)
-    page.fill("#ctl00_MainContent_txtSenha", senha)
-    page.keyboard.press("Return")
-    page.wait_for_load_state("networkidle")
-    return "Default.aspx" in page.url
+    page.goto(URL_ACOMPANHAMENTO)
+    page.wait_for_load_state("domcontentloaded")
+    page.wait_for_selector("#ctl00_MainContent_rcbCredenciado_Input", timeout=30000)
+    page.locator("#ctl00_MainContent_rcbCredenciado_Input").click()
+    page.wait_for_selector(
+        "#ctl00_MainContent_rcbCredenciado_DropDown .rcbList li",
+        timeout=10000,
+    )
+    itens = page.locator("#ctl00_MainContent_rcbCredenciado_DropDown .rcbList li")
+    credenciados = [
+        itens.nth(i).text_content().strip()
+        for i in range(itens.count())
+        if itens.nth(i).text_content().strip()
+    ]
+    page.keyboard.press("Escape")
+    page.wait_for_timeout(500)
+    return credenciados
 
 
 def buscar_acompanhamento(page, data_ini, data_fim, credenciado, log_queue):
@@ -408,20 +416,16 @@ def buscar_acompanhamento(page, data_ini, data_fim, credenciado, log_queue):
     campo_fim.type(data_fim)
     campo_fim.press("Tab")
 
+    # Abre o dropdown e clica diretamente no item pelo código único
+    codigo = credenciado.split(" - ")[0].strip()
     cred_input = page.locator("#ctl00_MainContent_rcbCredenciado_Input")
     cred_input.click()
-    cred_input.press("Control+a")
-    cred_input.type(credenciado[:10])
     page.wait_for_selector(
         "#ctl00_MainContent_rcbCredenciado_DropDown .rcbList li",
         timeout=10000,
     )
     page.wait_for_timeout(500)
-    itens = page.locator("#ctl00_MainContent_rcbCredenciado_DropDown .rcbList li")
-    for i in range(itens.count()):
-        if credenciado in (itens.nth(i).text_content() or ""):
-            itens.nth(i).click()
-            break
+    page.locator(f"#ctl00_MainContent_rcbCredenciado_DropDown .rcbList li:has-text('{codigo}')").click()
     page.wait_for_timeout(500)
 
     log_queue.put("Executando busca...")
@@ -445,17 +449,29 @@ def buscar_acompanhamento(page, data_ini, data_fim, credenciado, log_queue):
     return dados
 
 
-def acompanhamento_thread(usuario, senha, data_ini, data_fim, credenciado, log_queue):
+def acompanhamento_thread(usuario, senha, api_key, log_queue, cmd_queue):
     try:
         with sync_playwright() as p:
             browser = _criar_browser(p)
             page = _criar_context(browser).new_page()
 
-            ok = login_amhptiss_direto(page, usuario, senha, log_queue)
+            ok = login_com_2captcha(page, usuario, senha, api_key, log_queue)
             if not ok:
-                raise Exception("Login AMHPTISS falhou. Verifique usuário e senha.")
+                raise Exception("Login falhou. Verifique CPF/CNPJ, senha e saldo no 2captcha.")
 
-            log_queue.put("Login realizado!")
+            log_queue.put("Login realizado! Buscando credenciados disponíveis...")
+            credenciados = obter_credenciados_acompanhamento(page)
+            log_queue.put(f"{len(credenciados)} credenciado(s) encontrado(s).")
+            log_queue.put(("CREDENCIADOS_ACOMP", credenciados))
+
+            # Aguarda o usuário selecionar datas e credenciado
+            filtros = cmd_queue.get()
+            if filtros is None:
+                browser.close()
+                return
+
+            data_ini, data_fim, credenciado = filtros
+            log_queue.put(f"Buscando atendimentos...")
             dados = buscar_acompanhamento(page, data_ini, data_fim, credenciado, log_queue)
             browser.close()
 
@@ -473,6 +489,14 @@ def acompanhamento_thread(usuario, senha, data_ini, data_fim, credenciado, log_q
         ws.title = "Envios Digitais"
         for row in dados:
             ws.append(row)
+        # Converte coluna J (índice 9) para número a partir da linha 2
+        for row in ws.iter_rows(min_row=2, min_col=10, max_col=10):
+            for cell in row:
+                if cell.value:
+                    try:
+                        cell.value = float(str(cell.value).replace(",", ".").replace(" ", ""))
+                    except (ValueError, TypeError):
+                        pass
         for col in ws.columns:
             max_len = max((len(str(cell.value)) for cell in col if cell.value), default=10)
             ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 50)
@@ -553,9 +577,15 @@ if os.path.exists("amhplogo.png"):
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
         st.image("amhplogo.png", use_container_width=True)
-    st.markdown("<br>", unsafe_allow_html=True)
 else:
     st.title("Exportar Extrato AMHP")
+
+st.markdown(
+    "<p style='text-align:center; color:#4A7FA5; font-size:0.95rem; margin-top:0.25rem; margin-bottom:1.25rem;'>"
+    "Acompanhe os envios e baixas de faturamento da AMHPDF em um só lugar."
+    "</p>",
+    unsafe_allow_html=True,
+)
 
 api_key = carregar_api_key()
 
@@ -564,6 +594,7 @@ for _k, _v in [
     ("step", "input"), ("referencias", []), ("usuario", ""), ("senha", ""),
     ("selecionadas", []), ("arquivos_finais", []),
     ("acomp_step", "input"), ("acomp_arquivo", None), ("acomp_total", 0),
+    ("acomp_credenciados", []),
     ("relatorio", "quitacoes"),
 ]:
     if _k not in st.session_state:
@@ -705,6 +736,7 @@ if extrato_em_progresso:
 
         if arquivos_finais:
             st.success(f"Concluído! {len(csvs)} arquivo(s) exportado(s).")
+            st.info("Obrigado por utilizar nosso sistema! — Equipe B4")
             st.subheader("Baixar arquivos")
             for arq in csvs:
                 with open(arq, "rb") as f:
@@ -740,11 +772,84 @@ if extrato_em_progresso:
 # ──────────────────────────────────────────────────────────────────
 elif acomp_em_progresso:
 
-    # ── Etapa 2: processando ──────────────────────────────────────
-    if st.session_state.acomp_step == "processando":
+    # ── Etapa 2: aguardando credenciados ─────────────────────────
+    if st.session_state.acomp_step == "buscando":
         log_queue  = st.session_state.acomp_log_queue
         thread     = st.session_state.acomp_thread
-        ESTIMATIVA = 40
+        ESTIMATIVA = 25
+
+        st.markdown("**Autenticando...**")
+        progress_bar       = st.progress(0.0)
+        col_timer, col_est = st.columns([1, 3])
+        timer_ph           = col_timer.empty()
+        col_est.caption(f"Tempo estimado: ~{ESTIMATIVA}s")
+        status_ph          = st.empty()
+        logs, credenciados, erro = [], None, None
+        start_time         = time.time()
+
+        while credenciados is None and erro is None:
+            elapsed = time.time() - start_time
+            progress_bar.progress(min(elapsed / ESTIMATIVA, 0.95))
+            timer_ph.metric("⏱", f"{int(elapsed)}s")
+
+            while not log_queue.empty():
+                item = log_queue.get_nowait()
+                if isinstance(item, tuple) and item[0] == "CREDENCIADOS_ACOMP":
+                    credenciados = item[1]
+                elif isinstance(item, tuple) and item[0] == "ERRO_ACOMP":
+                    erro = item[1]
+                else:
+                    logs.append(str(item))
+                    status_ph.info(logs[-1])
+
+            if credenciados is None and erro is None:
+                if not thread.is_alive():
+                    erro = "Sessão encerrada inesperadamente."
+                    break
+                time.sleep(0.2)
+
+        progress_bar.progress(1.0)
+
+        if erro:
+            st.session_state.acomp_cmd_queue.put(None)
+            st.session_state.acomp_erro = erro
+            st.session_state.acomp_step = "input"
+        else:
+            st.session_state.acomp_credenciados = credenciados
+            st.session_state.acomp_step = "select_filters"
+        st.rerun()
+
+    # ── Etapa 3: seleção de filtros ───────────────────────────────
+    elif st.session_state.acomp_step == "select_filters":
+        credenciados = st.session_state.acomp_credenciados
+        st.markdown(f"**{len(credenciados)} credenciado(s) disponível(is)**")
+
+        with st.form("acomp_filtros_form"):
+            col_ini, col_fim = st.columns(2)
+            with col_ini:
+                data_ini_dt = st.date_input("Data Início", format="DD/MM/YYYY")
+            with col_fim:
+                data_fim_dt = st.date_input("Data Fim", format="DD/MM/YYYY")
+            credenciado = st.selectbox("Credenciado", credenciados)
+            buscar = st.form_submit_button("Buscar Atendimentos", use_container_width=True)
+
+        if st.button("← Voltar", use_container_width=True):
+            st.session_state.acomp_cmd_queue.put(None)
+            st.session_state.acomp_step = "input"
+            st.rerun()
+
+        if buscar:
+            data_ini = data_ini_dt.strftime("%d/%m/%Y")
+            data_fim = data_fim_dt.strftime("%d/%m/%Y")
+            st.session_state.acomp_cmd_queue.put((data_ini, data_fim, credenciado))
+            st.session_state.acomp_step = "processando"
+            st.rerun()
+
+    # ── Etapa 4: processando ──────────────────────────────────────
+    elif st.session_state.acomp_step == "processando":
+        log_queue  = st.session_state.acomp_log_queue
+        thread     = st.session_state.acomp_thread
+        ESTIMATIVA = 30
 
         st.markdown("**Buscando atendimentos...**")
         progress_bar       = st.progress(0.0)
@@ -788,12 +893,13 @@ elif acomp_em_progresso:
             st.session_state.acomp_step    = "done"
         st.rerun()
 
-    # ── Etapa 3: download ─────────────────────────────────────────
+    # ── Etapa 5: download ─────────────────────────────────────────
     elif st.session_state.acomp_step == "done":
         nome_arq = st.session_state.acomp_arquivo
         total    = st.session_state.acomp_total
 
         st.success(f"Concluído! {total} linha(s) encontrada(s).")
+        st.info("Obrigado por usar o sistema AMHPDF. Bom trabalho!")
         if nome_arq and os.path.exists(nome_arq):
             with open(nome_arq, "rb") as f:
                 st.download_button(
@@ -805,8 +911,8 @@ elif acomp_em_progresso:
 
         st.markdown("<br>", unsafe_allow_html=True)
         if st.button("Nova Busca", use_container_width=True):
-            for _k in ["acomp_step", "acomp_arquivo", "acomp_total",
-                       "acomp_log_queue", "acomp_thread"]:
+            for _k in ["acomp_step", "acomp_arquivo", "acomp_total", "acomp_credenciados",
+                       "acomp_log_queue", "acomp_cmd_queue", "acomp_thread"]:
                 st.session_state.pop(_k, None)
             st.rerun()
 
@@ -814,12 +920,11 @@ elif acomp_em_progresso:
 # Tela inicial: seletor + formulário
 # ──────────────────────────────────────────────────────────────────
 else:
-    st.radio(
+    st.selectbox(
         "Selecione o relatório:",
         options=["quitacoes", "acompanhamento"],
         format_func=lambda x: "📄 Relatório de Quitações" if x == "quitacoes" else "📋 Acompanhamento de Envios Digitais",
         key="relatorio",
-        horizontal=True,
     )
     st.markdown("---")
 
@@ -834,7 +939,7 @@ else:
             with st.form("credentials_form"):
                 usuario = st.text_input("CPF/CNPJ")
                 senha   = st.text_input("Senha", type="password")
-                buscar  = st.form_submit_button("Buscar Referências", use_container_width=True)
+                buscar  = st.form_submit_button("Entrar", use_container_width=True)
 
             if buscar:
                 if not usuario or not senha:
@@ -860,32 +965,31 @@ else:
         if st.session_state.get("acomp_erro"):
             st.error(st.session_state.pop("acomp_erro"))
 
-        with st.form("acomp_form"):
-            acomp_usuario    = st.text_input("Usuário (login AMHPTISS)")
-            acomp_senha      = st.text_input("Senha", type="password")
-            col_ini, col_fim = st.columns(2)
-            with col_ini:
-                acomp_data_ini = st.text_input("Data Início (dd/MM/yyyy)")
-            with col_fim:
-                acomp_data_fim = st.text_input("Data Fim (dd/MM/yyyy)")
-            acomp_credenciado = st.selectbox("Credenciado", CREDENCIADOS)
-            acomp_buscar = st.form_submit_button("Buscar Atendimentos", use_container_width=True)
+        if not api_key:
+            st.error("Chave 2captcha nao configurada. Defina a variavel de ambiente ANTICAPTCHA_KEY.")
+        else:
+            with st.form("acomp_form"):
+                acomp_usuario = st.text_input("CPF/CNPJ")
+                acomp_senha   = st.text_input("Senha", type="password")
+                acomp_buscar  = st.form_submit_button("Entrar", use_container_width=True)
 
-        if acomp_buscar:
-            if not acomp_usuario or not acomp_senha or not acomp_data_ini or not acomp_data_fim:
-                st.error("Preencha todos os campos.")
-            else:
-                st.session_state.acomp_log_queue = queue.Queue()
-                t = threading.Thread(
-                    target=acompanhamento_thread,
-                    args=(acomp_usuario, acomp_senha, acomp_data_ini, acomp_data_fim,
-                          acomp_credenciado, st.session_state.acomp_log_queue),
-                    daemon=True,
-                )
-                t.start()
-                st.session_state.acomp_thread = t
-                st.session_state.acomp_step = "processando"
-                st.rerun()
+            if acomp_buscar:
+                if not acomp_usuario or not acomp_senha:
+                    st.error("Preencha CPF/CNPJ e Senha.")
+                else:
+                    st.session_state.acomp_log_queue = queue.Queue()
+                    st.session_state.acomp_cmd_queue = queue.Queue()
+                    t = threading.Thread(
+                        target=acompanhamento_thread,
+                        args=(acomp_usuario, acomp_senha, api_key,
+                              st.session_state.acomp_log_queue,
+                              st.session_state.acomp_cmd_queue),
+                        daemon=True,
+                    )
+                    t.start()
+                    st.session_state.acomp_thread = t
+                    st.session_state.acomp_step = "buscando"
+                    st.rerun()
 
 # ── Rodapé ────────────────────────────────────────────────────────
 if os.path.exists("logo_b4strategy.png"):
