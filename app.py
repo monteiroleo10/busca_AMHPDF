@@ -8,10 +8,12 @@ Fluxo:
   4. Relatório escolhido → volta ao menu
 """
 import streamlit as st
+import streamlit.components.v1 as components
 import threading
 import queue
 import os
 import glob
+import json
 import platform
 import time
 import re
@@ -37,9 +39,30 @@ URL_PERFIL          = "https://portal.amhp.com.br/pages/PJ/perfil.html"
 URL_EXTRATO         = "https://amhptiss.amhp.com.br/Extrato.aspx"
 URL_ACOMPANHAMENTO  = "https://amhptiss.amhp.com.br/AcompanhamentoAtendimentoDigital.aspx"
 
+CONFIG_FILE = os.path.join(
+    os.path.expanduser("~"), ".amhp_app_config.json"
+)
+
 
 def carregar_api_key():
     return os.environ.get("ANTICAPTCHA_KEY", "")
+
+
+def carregar_config():
+    """Carrega preferências locais (último CPF/CNPJ, etc.). Nunca salva senha."""
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def salvar_config(cfg):
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False)
+    except Exception:
+        pass
 
 
 def encontrar_chromium():
@@ -760,8 +783,35 @@ for k, v in DEFAULTS.items():
         st.session_state[k] = v
 
 
+def proteger_contra_fechar_aba():
+    """
+    Injeta JS que faz o navegador perguntar 'Tem certeza que quer sair?' quando
+    o usuário tenta fechar a aba ou recarregar. Importante porque hoje fechar
+    a aba no meio de uma operação deixa a sessão (e o browser do robô) órfã.
+    Os navegadores modernos mostram um diálogo genérico — a mensagem custom
+    não é exibida por segurança, mas o aviso aparece.
+    """
+    components.html(
+        """
+        <script>
+        const win = window.parent || window;
+        if (!win.__amhp_unload_attached) {
+            win.addEventListener('beforeunload', function(e) {
+                e.preventDefault();
+                e.returnValue = '';
+                return '';
+            });
+            win.__amhp_unload_attached = true;
+        }
+        </script>
+        """,
+        height=0,
+    )
+
+
 def banner_sessao_ativa():
     """Mostra um banner indicando que há uma sessão ativa no navegador."""
+    proteger_contra_fechar_aba()
     cred = st.session_state.get("credenciado_atual")
     if cred:
         st.markdown(
@@ -777,6 +827,21 @@ def banner_sessao_ativa():
         )
 
 
+def botao_cancelar_operacao(key):
+    """Renderiza um botão de cancelar que encerra a sessão inteira."""
+    st.markdown('<div class="stButton secundario">', unsafe_allow_html=True)
+    clicado = st.button(
+        "✖ Cancelar operação (encerra sessão)",
+        use_container_width=True,
+        key=key,
+        help="Cancela a operação em andamento e fecha a sessão no navegador. Você precisará logar de novo.",
+    )
+    st.markdown('</div>', unsafe_allow_html=True)
+    if clicado:
+        resetar_sessao()
+        st.rerun()
+
+
 # ──────────────────────────────────────────────────────────────────
 # TELA: Login (formulário)
 # ──────────────────────────────────────────────────────────────────
@@ -787,8 +852,17 @@ if st.session_state.step == "input":
     if not api_key:
         st.error("Chave 2captcha não configurada. Defina a variável de ambiente ANTICAPTCHA_KEY.")
     else:
+        config = carregar_config()
+        usuario_default = config.get("ultimo_usuario", "")
+
+        st.info(
+            "🔐 Use o **mesmo CPF/CNPJ e senha** que você usa para entrar no site da AMHP "
+            "([portal.amhp.com.br](https://portal.amhp.com.br/)). "
+            "Nada é armazenado em nenhum servidor — o app apenas automatiza o acesso ao portal por você."
+        )
+
         with st.form("login_form"):
-            usuario = st.text_input("CPF/CNPJ")
+            usuario = st.text_input("CPF/CNPJ", value=usuario_default)
             senha   = st.text_input("Senha", type="password")
             entrar  = st.form_submit_button("Entrar", use_container_width=True)
 
@@ -796,6 +870,7 @@ if st.session_state.step == "input":
             if not usuario or not senha:
                 st.error("Preencha CPF/CNPJ e Senha.")
             else:
+                salvar_config({"ultimo_usuario": usuario})
                 st.session_state.usuario   = usuario
                 st.session_state.senha     = senha
                 st.session_state.log_queue = queue.Queue()
@@ -817,6 +892,7 @@ if st.session_state.step == "input":
 # TELA: Autenticando + buscando credenciados
 # ──────────────────────────────────────────────────────────────────
 elif st.session_state.step == "logando":
+    proteger_contra_fechar_aba()
     log_queue  = st.session_state.log_queue
     thread     = st.session_state.browser_thread
     ESTIMATIVA = 55  # segundos
@@ -890,6 +966,7 @@ elif st.session_state.step == "logando":
 # TELA: Escolher credenciado
 # ──────────────────────────────────────────────────────────────────
 elif st.session_state.step == "escolher_credenciado":
+    banner_sessao_ativa()
     st.markdown(f"**{len(st.session_state.credenciados)} credenciado(s) disponível(is)**")
     st.caption("Escolha o credenciado para o qual você quer gerar relatórios.")
 
@@ -971,6 +1048,7 @@ elif st.session_state.step == "quitacao_listando":
     timer_ph     = col_t.empty()
     msg_ph       = col_m.empty()
     status_ph    = st.empty()
+    botao_cancelar_operacao(key="cancel_quit_list")
 
     start_time = time.time()
     eventos    = []
@@ -1024,29 +1102,75 @@ elif st.session_state.step == "quitacao_selecionar":
     banner_sessao_ativa()
     st.markdown(f"**{len(st.session_state.referencias)} referência(s) disponível(is)**")
 
-    selecionadas = st.multiselect(
+    # Inicializa a seleção uma única vez (primeira referência)
+    if "refs_multi" not in st.session_state:
+        st.session_state["refs_multi"] = (
+            st.session_state.referencias[:1] if st.session_state.referencias else []
+        )
+
+    # Filtro + botões marcar/desmarcar
+    col_filtro, col_m, col_d = st.columns([3, 1, 1])
+    with col_filtro:
+        filtro = st.text_input(
+            "Filtrar",
+            placeholder="Ex: 2025, Out, ...",
+            label_visibility="collapsed",
+            key="filtro_refs",
+        )
+    filtro_lc = (filtro or "").lower()
+    refs_filtradas = [r for r in st.session_state.referencias if filtro_lc in r.lower()]
+
+    with col_m:
+        if st.button("✓ Todas", use_container_width=True, key="marcar_todas"):
+            # Marca todas as filtradas (preservando outras já marcadas que estão fora do filtro)
+            fora_filtro = [r for r in st.session_state["refs_multi"] if r not in refs_filtradas]
+            st.session_state["refs_multi"] = fora_filtro + refs_filtradas
+            st.rerun()
+    with col_d:
+        if st.button("✗ Nenhuma", use_container_width=True, key="desmarcar_todas"):
+            # Desmarca apenas as filtradas
+            st.session_state["refs_multi"] = [
+                r for r in st.session_state["refs_multi"] if r not in refs_filtradas
+            ]
+            st.rerun()
+
+    # Multiselect (só mostra as filtradas; o session_state mantém também as fora do filtro)
+    if filtro_lc:
+        st.caption(f"Mostrando {len(refs_filtradas)} de {len(st.session_state.referencias)}")
+
+    selecionadas_visiveis = st.multiselect(
         "Selecione as referências para exportar:",
-        options=st.session_state.referencias,
-        default=st.session_state.referencias[:1] if st.session_state.referencias else [],
+        options=refs_filtradas,
+        default=[r for r in st.session_state["refs_multi"] if r in refs_filtradas],
+        key="multi_widget",
     )
+    # Atualiza o estado completo (visíveis selecionadas + invisíveis preservadas)
+    invisiveis = [r for r in st.session_state["refs_multi"] if r not in refs_filtradas]
+    st.session_state["refs_multi"] = invisiveis + selecionadas_visiveis
+
+    total_marcadas = len(st.session_state["refs_multi"])
+    if total_marcadas:
+        st.caption(f"📌 {total_marcadas} referência(s) marcada(s) no total")
 
     col1, col2 = st.columns(2)
     with col1:
         st.markdown('<div class="stButton secundario">', unsafe_allow_html=True)
         if st.button("← Voltar ao menu", use_container_width=True, key="voltar_quit_sel"):
+            st.session_state.pop("refs_multi", None)
             st.session_state.step = "menu"
             st.rerun()
         st.markdown('</div>', unsafe_allow_html=True)
     with col2:
         if st.button("Exportar selecionados →", use_container_width=True, key="exp_quit"):
-            if not selecionadas:
+            if not st.session_state["refs_multi"]:
                 st.error("Selecione ao menos uma referência.")
             else:
-                st.session_state.selecionadas = selecionadas
+                st.session_state.selecionadas = list(st.session_state["refs_multi"])
                 st.session_state.logs_acumulados = []
                 esvaziar_log_queue()
                 st.session_state.cmd_queue.put(
-                    ("RODAR_QUITACAO", st.session_state.credenciado_atual, selecionadas)
+                    ("RODAR_QUITACAO", st.session_state.credenciado_atual,
+                     st.session_state.selecionadas)
                 )
                 st.session_state.step = "quitacao_exportando"
                 st.rerun()
@@ -1065,6 +1189,7 @@ elif st.session_state.step == "quitacao_exportando":
     progress_bar = st.progress(0.0)
     timer_ph     = st.empty()
     log_ph       = st.empty()
+    botao_cancelar_operacao(key="cancel_quit_exp")
 
     start_time   = time.time()
     eventos      = []
@@ -1120,7 +1245,12 @@ elif st.session_state.step == "quitacao_done":
     excel = next((f for f in arquivos if f.endswith(".xlsx")), None)
 
     if arquivos:
-        st.success(f"Concluído! {len(csvs)} arquivo(s) exportado(s).")
+        if not st.session_state.get("quitacao_celebrou"):
+            st.balloons()
+            st.session_state["quitacao_celebrou"] = True
+
+        st.success(f"✅ Concluído! {len(csvs)} arquivo(s) exportado(s).")
+        st.caption(f"📁 Salvos também em: `{PASTA_DESTINO}`")
         st.subheader("Baixar arquivos")
         for arq in csvs:
             with open(arq, "rb") as f:
@@ -1146,6 +1276,8 @@ elif st.session_state.step == "quitacao_done":
     st.markdown("<br>", unsafe_allow_html=True)
     if st.button("← Voltar ao menu", use_container_width=True, key="voltar_quit_done"):
         st.session_state.arquivos_quitacao = []
+        st.session_state.pop("quitacao_celebrou", None)
+        st.session_state.pop("refs_multi", None)
         st.session_state.step = "menu"
         st.rerun()
 
@@ -1202,6 +1334,7 @@ elif st.session_state.step == "acomp_buscando":
     timer_ph     = col_t.empty()
     msg_ph       = col_m.empty()
     log_ph       = st.empty()
+    botao_cancelar_operacao(key="cancel_acomp")
 
     start_time = time.time()
     eventos    = []
@@ -1255,7 +1388,12 @@ elif st.session_state.step == "acomp_done":
     nome_arq = st.session_state.acomp_arquivo
     total    = st.session_state.acomp_total
 
-    st.success(f"Concluído! {total} linha(s) encontrada(s).")
+    if not st.session_state.get("acomp_celebrou"):
+        st.balloons()
+        st.session_state["acomp_celebrou"] = True
+
+    st.success(f"✅ Concluído! {total} linha(s) encontrada(s).")
+    st.caption(f"📁 Salvo também em: `{PASTA_DESTINO}`")
     if nome_arq and os.path.exists(nome_arq):
         with open(nome_arq, "rb") as f:
             st.download_button(
@@ -1270,6 +1408,7 @@ elif st.session_state.step == "acomp_done":
     if st.button("← Voltar ao menu", use_container_width=True, key="voltar_acomp_done"):
         st.session_state.acomp_arquivo = None
         st.session_state.acomp_total   = 0
+        st.session_state.pop("acomp_celebrou", None)
         st.session_state.step          = "menu"
         st.rerun()
 
