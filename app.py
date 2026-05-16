@@ -2388,16 +2388,30 @@ elif st.session_state.step == "analise_manual_upload":
         elif not quitacoes_files:
             st.error("Suba pelo menos um arquivo de quitação.")
         else:
+            progresso = st.empty()
             try:
+                progresso.info(f"📄 Lendo envios ({envios_file.name})...")
                 envios_df = ler_arquivo_para_df(envios_file)
+                progresso.info(
+                    f"✅ Envios: {len(envios_df)} linha(s), "
+                    f"{len(envios_df.columns)} coluna(s). Lendo quitações..."
+                )
+
                 frames = []
-                for f in quitacoes_files:
+                for i, f in enumerate(quitacoes_files, start=1):
+                    progresso.info(f"📄 Lendo quitação [{i}/{len(quitacoes_files)}]: {f.name}...")
                     df = ler_arquivo_para_df(f)
                     df["__Referencia"] = f.name.rsplit(".", 1)[0]
                     frames.append(df)
                 quitacoes_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+                progresso.info(
+                    f"✅ Quitações: {len(quitacoes_df)} linha(s) no total. "
+                    "Cruzando dados..."
+                )
 
                 analise_df, diag = cruzar_envios_quitacoes(envios_df, quitacoes_df)
+                progresso.info("✅ Cruzamento feito. Montando tabelas auxiliares...")
+
                 glosas_df = tabela_glosas(quitacoes_df, diag)
                 prazos_df = tabela_prazos_por_convenio(quitacoes_df, diag)
                 orfas_df  = tabela_orfas(quitacoes_df, envios_df, diag)
@@ -2416,10 +2430,14 @@ elif st.session_state.step == "analise_manual_upload":
                     "refs_quitacao": [f.name for f in quitacoes_files],
                     "gerado_em":     datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
                 }
+                progresso.success("✅ Pronto! Carregando tela de resultado...")
                 st.session_state.step = "analise_manual_done"
                 st.rerun()
             except Exception as e:
+                import traceback
+                progresso.empty()
                 st.error(f"Erro ao processar arquivos: {e}")
+                st.code(traceback.format_exc(), language="text")
 
 
 # ──────────────────────────────────────────────────────────────────
