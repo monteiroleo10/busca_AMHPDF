@@ -432,14 +432,45 @@ def buscar_acompanhamento(page, data_ini, data_fim, credenciado, log_queue):
 
     log_queue.put("Executando busca...")
     page.locator("#ctl00_MainContent_btnBuscarAtendimentos_input").click()
+    # Para períodos longos a AMHP pode demorar muito pra processar.
+    # Damos uma janela generosa pro overlay de loading sumir.
     try:
-        page.wait_for_selector(".raDiv", state="hidden", timeout=30000)
+        page.wait_for_selector(".raDiv", state="hidden", timeout=300000)  # 5 min
     except Exception:
-        pass
-    # Pausa defensiva para a tabela popular após a busca. A AMHP renderiza
-    # o cabecalho da tabela antes dos dados chegarem, entao um wait_for_selector
-    # por <tr> retornaria cedo demais e a leitura viria vazia.
-    page.wait_for_timeout(2000)
+        log_queue.put("⚠️ Indicador de carregamento não sumiu em 5 min, tentando extrair mesmo assim.")
+
+    # Em vez de uma pausa fixa, espera ativamente a tabela popular (linha com
+    # dados) OU a mensagem de "nenhum registro". Sai antes se um dos dois aparece.
+    log_queue.put("Aguardando tabela popular...")
+    try:
+        page.wait_for_function(
+            """() => {
+                const tabela = document.querySelector(
+                    '#ctl00_MainContent_rdgAcompanhamentoDigital'
+                );
+                if (!tabela) return false;
+                // Linha de dados (td com conteúdo)
+                const linhas = tabela.querySelectorAll(
+                    'table.rgMasterTable tbody tr'
+                );
+                for (const tr of linhas) {
+                    const tds = tr.querySelectorAll('td');
+                    if (tds.length > 0) {
+                        for (const td of tds) {
+                            if ((td.innerText || '').trim() !== '') return true;
+                        }
+                    }
+                }
+                // Ou mensagem de "sem registros" do Telerik
+                if (tabela.querySelector('.rgNoRecords, .rgEmptyData')) return true;
+                return false;
+            }""",
+            timeout=300000,  # 5 min
+        )
+    except Exception:
+        log_queue.put("⚠️ Tabela demorou para popular, tentando extrair mesmo assim.")
+    # Pequena margem após o sinal de pronto.
+    page.wait_for_timeout(500)
 
     log_queue.put("Extraindo dados da tabela...")
     # Extracao em UMA chamada ao navegador (em vez de uma por celula).
