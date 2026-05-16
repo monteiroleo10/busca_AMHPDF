@@ -621,6 +621,31 @@ def quitacoes_para_df(csv_paths):
     return pd.concat(frames, ignore_index=True)
 
 
+def ler_arquivo_para_df(uploaded_file):
+    """Lê um arquivo do upload (XLSX, XLS ou CSV) e retorna DataFrame.
+    Para CSV tenta combinações comuns de separador e encoding (formato AMHP
+    usa ;/latin1, mas Excel pode exportar como ,/utf-8)."""
+    nome = uploaded_file.name.lower()
+    if nome.endswith((".xlsx", ".xls")):
+        uploaded_file.seek(0)
+        return pd.read_excel(uploaded_file, dtype=str)
+    if nome.endswith(".csv"):
+        melhor = None
+        for enc in ["latin1", "utf-8", "utf-8-sig"]:
+            for sep in [";", ","]:
+                try:
+                    uploaded_file.seek(0)
+                    df = pd.read_csv(uploaded_file, sep=sep, encoding=enc, dtype=str)
+                    if melhor is None or len(df.columns) > len(melhor.columns):
+                        melhor = df
+                except Exception:
+                    continue
+        if melhor is not None:
+            return melhor
+        raise ValueError(f"Não consegui ler o CSV {uploaded_file.name}.")
+    raise ValueError(f"Formato não suportado: {uploaded_file.name}")
+
+
 def cruzar_envios_quitacoes(envios_df, quitacoes_df):
     """
     Cruza por número da guia. Retorna (analise_df, diag) onde:
@@ -1380,7 +1405,10 @@ if st.session_state.step == "input":
         st.error(st.session_state.pop("erro"))
 
     if not api_key:
-        st.error("Chave 2captcha não configurada. Defina a variável de ambiente ANTICAPTCHA_KEY.")
+        st.warning(
+            "Chave 2captcha não configurada — você não pode entrar no portal AMHP, "
+            "mas pode usar a **Análise manual** abaixo."
+        )
     else:
         config = carregar_config()
         usuario_default = config.get("ultimo_usuario", "")
@@ -1416,6 +1444,13 @@ if st.session_state.step == "input":
                 st.session_state.step = "logando"
                 st.session_state.logs_acumulados = []
                 st.rerun()
+
+    st.markdown("---")
+    st.caption("Sem precisar entrar no portal:")
+    if st.button("📂 Análise manual (subir arquivos)", use_container_width=True,
+                 key="btn_analise_manual", type="secondary"):
+        st.session_state.step = "analise_manual_upload"
+        st.rerun()
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -2296,6 +2331,219 @@ elif st.session_state.step == "analise_done":
             st.session_state.pop(chave, None)
         st.session_state.step = "menu"
         st.rerun()
+
+
+# ──────────────────────────────────────────────────────────────────
+# TELA: Análise manual — upload
+# ──────────────────────────────────────────────────────────────────
+elif st.session_state.step == "analise_manual_upload":
+    st.markdown("**Análise Manual: Envios vs Quitações**")
+    st.info(
+        "Faça upload do arquivo de envios e dos arquivos de quitação. "
+        "O cruzamento é feito localmente, **sem precisar acessar o portal AMHP**. "
+        "Aceita XLSX, XLS e CSV."
+    )
+
+    envios_file = st.file_uploader(
+        "Arquivo de Envios (Acompanhamento)",
+        type=["xlsx", "xls", "csv"],
+        accept_multiple_files=False,
+        key="manual_envios",
+    )
+
+    quitacoes_files = st.file_uploader(
+        "Arquivos de Quitação (Extrato) — pode subir vários",
+        type=["xlsx", "xls", "csv"],
+        accept_multiple_files=True,
+        key="manual_quitacoes",
+    )
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if st.button("← Voltar", use_container_width=True,
+                     key="voltar_manual_upload", type="secondary"):
+            st.session_state.step = "input"
+            st.rerun()
+    with col_b:
+        rodar = st.button("Rodar análise", use_container_width=True,
+                          type="primary", key="rodar_manual")
+
+    if rodar:
+        if not envios_file:
+            st.error("Suba o arquivo de envios.")
+        elif not quitacoes_files:
+            st.error("Suba pelo menos um arquivo de quitação.")
+        else:
+            try:
+                envios_df = ler_arquivo_para_df(envios_file)
+                frames = []
+                for f in quitacoes_files:
+                    df = ler_arquivo_para_df(f)
+                    df["__Referencia"] = f.name.rsplit(".", 1)[0]
+                    frames.append(df)
+                quitacoes_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+                analise_df, diag = cruzar_envios_quitacoes(envios_df, quitacoes_df)
+                glosas_df = tabela_glosas(quitacoes_df, diag)
+                prazos_df = tabela_prazos_por_convenio(quitacoes_df, diag)
+                orfas_df  = tabela_orfas(quitacoes_df, envios_df, diag)
+
+                st.session_state.analise_envios_df    = envios_df
+                st.session_state.analise_quitacoes_df = quitacoes_df
+                st.session_state.analise_resultado_df = analise_df
+                st.session_state.analise_diag         = diag
+                st.session_state.analise_glosas_df    = glosas_df
+                st.session_state.analise_prazos_df    = prazos_df
+                st.session_state.analise_orfas_df     = orfas_df
+                st.session_state.analise_meta = {
+                    "credenciado":   "(análise manual)",
+                    "data_ini":      "",
+                    "data_fim":      "",
+                    "refs_quitacao": [f.name for f in quitacoes_files],
+                    "gerado_em":     datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+                }
+                st.session_state.step = "analise_manual_done"
+                st.rerun()
+            except Exception as e:
+                st.error(f"Erro ao processar arquivos: {e}")
+
+
+# ──────────────────────────────────────────────────────────────────
+# TELA: Análise manual — resultado + downloads
+# ──────────────────────────────────────────────────────────────────
+elif st.session_state.step == "analise_manual_done":
+    analise_df   = st.session_state.analise_resultado_df
+    envios_df    = st.session_state.analise_envios_df
+    quitacoes_df = st.session_state.analise_quitacoes_df
+    glosas_df    = st.session_state.get("analise_glosas_df")
+    prazos_df    = st.session_state.get("analise_prazos_df")
+    orfas_df     = st.session_state.get("analise_orfas_df")
+    diag         = st.session_state.get("analise_diag", {})
+    meta         = st.session_state.analise_meta
+
+    if not st.session_state.get("analise_celebrou"):
+        st.balloons()
+        st.session_state["analise_celebrou"] = True
+
+    total      = len(analise_df)
+    quitadas   = int((analise_df["Status"] == "Quitada integralmente").sum())
+    parciais   = int((analise_df["Status"] == "Quitada parcial (glosa)").sum())
+    pendentes  = int((analise_df["Status"] == "Pendente").sum())
+    soma_env   = float(analise_df["Valor_Guia_Enviado"].sum())
+    soma_rec   = float(analise_df["Total_Repasse"].sum())
+    soma_dif   = float(analise_df["Diferenca"].sum())
+
+    st.success(f"✅ Análise concluída! {total} guia(s) processada(s).")
+    st.caption("Modo manual — arquivos enviados por upload.")
+
+    if diag.get("envios_duplicados"):
+        st.warning(
+            f"⚠️ {diag['envios_duplicados']} envio(s) tinham número de guia "
+            "repetido — os valores dessas guias foram somados na análise."
+        )
+
+    if orfas_df is not None and not orfas_df.empty:
+        soma_orfa = float(orfas_df["Total_Repasse"].sum())
+        st.warning(
+            f"⚠️ {len(orfas_df)} guia(s) da quitação não estão nos envios "
+            f"(provavelmente são de envios anteriores) — total recebido: "
+            f"R$ {soma_orfa:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+            + ". Veja a aba 'Quitações órfãs' no XLSX."
+        )
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total",     total)
+    c2.metric("Quitadas",  quitadas)
+    c3.metric("Parciais",  parciais)
+    c4.metric("Pendentes", pendentes)
+
+    c5, c6, c7 = st.columns(3)
+    c5.metric("Enviado (R$)",   f"{soma_env:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+    c6.metric("Recebido (R$)",  f"{soma_rec:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+    c7.metric("Diferença (R$)", f"{soma_dif:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+
+    with st.expander("🔎 Diagnóstico (colunas detectadas)"):
+        st.write({
+            "Valor da Guia (envios)":       diag.get("col_valor_envio")    or "❌ não detectada",
+            "Nº da Guia (envios)":          diag.get("col_guia_envio")     or "❌ não detectada",
+            "Nº da Guia (quitação)":        diag.get("col_guia_quitacao")  or "❌ não detectada",
+            "Valor do Repasse (quitação)":  diag.get("col_repasse")        or "❌ não detectada",
+            "Valor da Glosa (quitação)":    diag.get("col_glosa")          or "❌ não detectada",
+            "Código do Serviço (quitação)": diag.get("col_codigo")         or "❌ não detectada",
+            "Descrição do Serviço (quit.)": diag.get("col_descricao")      or "❌ não detectada",
+        })
+
+    st.markdown("---")
+    st.markdown("**Pré-visualização do resultado:**")
+    st.dataframe(analise_df, use_container_width=True, height=320)
+
+    if glosas_df is not None and not glosas_df.empty:
+        st.markdown(f"**Glosas detalhadas ({len(glosas_df)} procedimento(s) glosado(s)):**")
+        st.dataframe(glosas_df, use_container_width=True, height=240)
+
+    if prazos_df is not None and not prazos_df.empty:
+        st.markdown(f"**Prazos médios por convênio ({len(prazos_df)} convênio(s)):**")
+        st.dataframe(prazos_df, use_container_width=True, height=240)
+
+    if orfas_df is not None and not orfas_df.empty:
+        st.markdown(f"**Quitações órfãs ({len(orfas_df)} guia(s) sem envio no arquivo de envios):**")
+        st.dataframe(orfas_df, use_container_width=True, height=240)
+
+    st.markdown("---")
+    st.markdown("**Baixar resultados:**")
+    xlsx_bytes = gerar_xlsx_analise(
+        envios_df, quitacoes_df, analise_df, meta,
+        diag, glosas_df, prazos_df, orfas_df,
+    )
+    json_bytes = gerar_json_analise(envios_df, quitacoes_df, analise_df, meta)
+    stamp      = datetime.now().strftime("%Y%m%d_%H%M")
+    nome_base  = f"Analise_Manual_{stamp}"
+
+    col_x, col_j = st.columns(2)
+    with col_x:
+        st.download_button(
+            label="⬇️ Baixar XLSX",
+            data=xlsx_bytes,
+            file_name=f"{nome_base}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key="dl_manual_xlsx",
+        )
+    with col_j:
+        st.download_button(
+            label="⬇️ Baixar JSON (dados crus)",
+            data=json_bytes,
+            file_name=f"{nome_base}.json",
+            mime="application/json",
+            use_container_width=True,
+            key="dl_manual_json",
+        )
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    col_n, col_v = st.columns(2)
+    with col_n:
+        if st.button("↺ Nova análise manual", use_container_width=True,
+                     key="nova_manual", type="primary"):
+            for chave in [
+                "analise_envios_df", "analise_quitacoes_df", "analise_resultado_df",
+                "analise_glosas_df", "analise_prazos_df", "analise_orfas_df",
+                "analise_diag", "analise_meta", "analise_celebrou",
+                "manual_envios", "manual_quitacoes",
+            ]:
+                st.session_state.pop(chave, None)
+            st.session_state.step = "analise_manual_upload"
+            st.rerun()
+    with col_v:
+        if st.button("← Tela inicial", use_container_width=True,
+                     key="voltar_manual_done", type="secondary"):
+            for chave in [
+                "analise_envios_df", "analise_quitacoes_df", "analise_resultado_df",
+                "analise_glosas_df", "analise_prazos_df", "analise_orfas_df",
+                "analise_diag", "analise_meta", "analise_celebrou",
+            ]:
+                st.session_state.pop(chave, None)
+            st.session_state.step = "input"
+            st.rerun()
 
 
 # ──────────────────────────────────────────────────────────────────
