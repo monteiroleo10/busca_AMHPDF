@@ -23,6 +23,7 @@ import urllib.parse
 import base64
 import pandas as pd
 import openpyxl
+from openpyxl.utils import get_column_letter
 from datetime import date, datetime
 from playwright.sync_api import sync_playwright
 
@@ -568,7 +569,6 @@ def _aplicar_formato_data_xlsx(writer, sheet_name, df):
     ws = writer.sheets.get(sheet_name)
     if ws is None:
         return
-    from openpyxl.utils import get_column_letter
     for col_idx, col_name in enumerate(df.columns, start=1):
         if pd.api.types.is_datetime64_any_dtype(df[col_name]):
             letter = get_column_letter(col_idx)
@@ -1411,6 +1411,121 @@ def botao_cancelar_operacao(key):
         st.rerun()
 
 
+def _formatar_brl(valor):
+    """Formata float como '1.234,56' (estilo brasileiro)."""
+    return f"{valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def _render_resultado_analise(nome_base, contexto_label=None, key_prefix="analise"):
+    """Renderiza a tela de resultado da análise (métricas, diagnóstico,
+    preview, tabelas auxiliares e botões de download). Usado tanto pela
+    análise online quanto pela manual."""
+    analise_df   = st.session_state.analise_resultado_df
+    envios_df    = st.session_state.analise_envios_df
+    quitacoes_df = st.session_state.analise_quitacoes_df
+    glosas_df    = st.session_state.get("analise_glosas_df")
+    prazos_df    = st.session_state.get("analise_prazos_df")
+    orfas_df     = st.session_state.get("analise_orfas_df")
+    diag         = st.session_state.get("analise_diag", {})
+    meta         = st.session_state.analise_meta
+
+    if not st.session_state.get("analise_celebrou"):
+        st.balloons()
+        st.session_state["analise_celebrou"] = True
+
+    total     = len(analise_df)
+    quitadas  = int((analise_df["Status"] == "Quitada integralmente").sum())
+    parciais  = int((analise_df["Status"] == "Quitada parcial (glosa)").sum())
+    pendentes = int((analise_df["Status"] == "Pendente").sum())
+    soma_env  = float(analise_df["Valor_Guia_Enviado"].sum())
+    soma_rec  = float(analise_df["Total_Repasse"].sum())
+    soma_dif  = float(analise_df["Diferenca"].sum())
+
+    st.success(f"✅ Análise concluída! {total} guia(s) processada(s).")
+    if contexto_label:
+        st.caption(contexto_label)
+
+    if diag.get("envios_duplicados"):
+        st.warning(
+            f"⚠️ {diag['envios_duplicados']} envio(s) tinham número de guia "
+            "repetido — os valores dessas guias foram somados na análise."
+        )
+
+    if orfas_df is not None and not orfas_df.empty:
+        soma_orfa = float(orfas_df["Total_Repasse"].sum())
+        st.warning(
+            f"⚠️ {len(orfas_df)} guia(s) da quitação não estão nos envios "
+            "(provavelmente são de envios anteriores) — total recebido: "
+            f"R$ {_formatar_brl(soma_orfa)}. Veja a aba 'Quitações órfãs' no XLSX."
+        )
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total",     total)
+    c2.metric("Quitadas",  quitadas)
+    c3.metric("Parciais",  parciais)
+    c4.metric("Pendentes", pendentes)
+
+    c5, c6, c7 = st.columns(3)
+    c5.metric("Enviado (R$)",   _formatar_brl(soma_env))
+    c6.metric("Recebido (R$)",  _formatar_brl(soma_rec))
+    c7.metric("Diferença (R$)", _formatar_brl(soma_dif))
+
+    with st.expander("🔎 Diagnóstico (colunas detectadas)"):
+        st.write({
+            "Valor da Guia (envios)":       diag.get("col_valor_envio")    or "❌ não detectada",
+            "Nº da Guia (envios)":          diag.get("col_guia_envio")     or "❌ não detectada",
+            "Nº da Guia (quitação)":        diag.get("col_guia_quitacao")  or "❌ não detectada",
+            "Valor do Repasse (quitação)":  diag.get("col_repasse")        or "❌ não detectada",
+            "Valor da Glosa (quitação)":    diag.get("col_glosa")          or "❌ não detectada",
+            "Código do Serviço (quitação)": diag.get("col_codigo")         or "❌ não detectada",
+            "Descrição do Serviço (quit.)": diag.get("col_descricao")      or "❌ não detectada",
+        })
+
+    st.markdown("---")
+    st.markdown("**Pré-visualização do resultado:**")
+    st.dataframe(analise_df, use_container_width=True, height=320)
+
+    if glosas_df is not None and not glosas_df.empty:
+        st.markdown(f"**Glosas detalhadas ({len(glosas_df)} procedimento(s) glosado(s)):**")
+        st.dataframe(glosas_df, use_container_width=True, height=240)
+
+    if prazos_df is not None and not prazos_df.empty:
+        st.markdown(f"**Prazos médios por convênio ({len(prazos_df)} convênio(s)):**")
+        st.dataframe(prazos_df, use_container_width=True, height=240)
+
+    if orfas_df is not None and not orfas_df.empty:
+        st.markdown(f"**Quitações órfãs ({len(orfas_df)} guia(s) sem envio correspondente):**")
+        st.dataframe(orfas_df, use_container_width=True, height=240)
+
+    st.markdown("---")
+    st.markdown("**Baixar resultados:**")
+    xlsx_bytes = gerar_xlsx_analise(
+        envios_df, quitacoes_df, analise_df, meta,
+        diag, glosas_df, prazos_df, orfas_df,
+    )
+    json_bytes = gerar_json_analise(envios_df, quitacoes_df, analise_df, meta)
+
+    col_x, col_j = st.columns(2)
+    with col_x:
+        st.download_button(
+            label="⬇️ Baixar XLSX",
+            data=xlsx_bytes,
+            file_name=f"{nome_base}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key=f"dl_{key_prefix}_xlsx",
+        )
+    with col_j:
+        st.download_button(
+            label="⬇️ Baixar JSON (dados crus)",
+            data=json_bytes,
+            file_name=f"{nome_base}.json",
+            mime="application/json",
+            use_container_width=True,
+            key=f"dl_{key_prefix}_json",
+        )
+
+
 # ──────────────────────────────────────────────────────────────────
 # TELA: Login (formulário)
 # ──────────────────────────────────────────────────────────────────
@@ -1980,7 +2095,7 @@ elif st.session_state.step == "acomp_done":
         st.balloons()
         st.session_state["acomp_celebrou"] = True
 
-    st.success(f"✅ Concluído! {total} linha(s) encontrada(s).")
+    st.success(f"✅ Concluído! {total} envio(s) encontrado(s).")
     st.caption(f"📁 Salvo também em: `{PASTA_DESTINO}`")
     if nome_arq and os.path.exists(nome_arq):
         with open(nome_arq, "rb") as f:
@@ -2227,115 +2342,17 @@ elif st.session_state.step == "analise_processando":
 # ──────────────────────────────────────────────────────────────────
 elif st.session_state.step == "analise_done":
     banner_sessao_ativa()
-    analise_df   = st.session_state.analise_resultado_df
-    envios_df    = st.session_state.analise_envios_df
-    quitacoes_df = st.session_state.analise_quitacoes_df
-    glosas_df    = st.session_state.get("analise_glosas_df")
-    prazos_df    = st.session_state.get("analise_prazos_df")
-    orfas_df     = st.session_state.get("analise_orfas_df")
-    diag         = st.session_state.get("analise_diag", {})
-    meta         = st.session_state.analise_meta
-
-    if not st.session_state.get("analise_celebrou"):
-        st.balloons()
-        st.session_state["analise_celebrou"] = True
-
-    total      = len(analise_df)
-    quitadas   = int((analise_df["Status"] == "Quitada integralmente").sum())
-    parciais   = int((analise_df["Status"] == "Quitada parcial (glosa)").sum())
-    pendentes  = int((analise_df["Status"] == "Pendente").sum())
-    soma_env   = float(analise_df["Valor_Guia_Enviado"].sum())
-    soma_rec   = float(analise_df["Total_Repasse"].sum())
-    soma_dif   = float(analise_df["Diferenca"].sum())
-
-    st.success(f"✅ Análise concluída! {total} guia(s) processada(s).")
-
-    if diag.get("envios_duplicados"):
-        st.warning(
-            f"⚠️ {diag['envios_duplicados']} envio(s) tinham número de guia "
-            "repetido — os valores dessas guias foram somados na análise."
-        )
-
-    if orfas_df is not None and not orfas_df.empty:
-        soma_orfa = float(orfas_df["Total_Repasse"].sum())
-        st.warning(
-            f"⚠️ {len(orfas_df)} guia(s) da quitação não estão nos envios do "
-            f"período filtrado (vieram de envios anteriores) — total recebido: "
-            f"R$ {soma_orfa:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-            + ". Veja a aba 'Quitações órfãs' no XLSX."
-        )
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total",      total)
-    c2.metric("Quitadas",   quitadas)
-    c3.metric("Parciais",   parciais)
-    c4.metric("Pendentes",  pendentes)
-
-    c5, c6, c7 = st.columns(3)
-    c5.metric("Enviado (R$)",   f"{soma_env:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-    c6.metric("Recebido (R$)",  f"{soma_rec:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-    c7.metric("Diferença (R$)", f"{soma_dif:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-
-    with st.expander("🔎 Diagnóstico (colunas detectadas)"):
-        st.write({
-            "Valor da Guia (envios)":       diag.get("col_valor_envio")    or "❌ não detectada",
-            "Nº da Guia (envios)":          diag.get("col_guia_envio")     or "❌ não detectada",
-            "Nº da Guia (quitação)":        diag.get("col_guia_quitacao")  or "❌ não detectada",
-            "Valor do Repasse (quitação)":  diag.get("col_repasse")        or "❌ não detectada",
-            "Valor da Glosa (quitação)":    diag.get("col_glosa")          or "❌ não detectada",
-            "Código do Serviço (quitação)": diag.get("col_codigo")         or "❌ não detectada",
-            "Descrição do Serviço (quit.)": diag.get("col_descricao")      or "❌ não detectada",
-        })
-
-    st.markdown("---")
-    st.markdown("**Pré-visualização do resultado:**")
-    st.dataframe(analise_df, use_container_width=True, height=320)
-
-    if glosas_df is not None and not glosas_df.empty:
-        st.markdown(f"**Glosas detalhadas ({len(glosas_df)} procedimento(s) glosado(s)):**")
-        st.dataframe(glosas_df, use_container_width=True, height=240)
-
-    if prazos_df is not None and not prazos_df.empty:
-        st.markdown(f"**Prazos médios por convênio ({len(prazos_df)} convênio(s)):**")
-        st.dataframe(prazos_df, use_container_width=True, height=240)
-
-    if orfas_df is not None and not orfas_df.empty:
-        st.markdown(f"**Quitações órfãs ({len(orfas_df)} guia(s) sem envio no período):**")
-        st.dataframe(orfas_df, use_container_width=True, height=240)
-
-    st.markdown("---")
-    st.markdown("**Baixar resultados:**")
-    xlsx_bytes = gerar_xlsx_analise(
-        envios_df, quitacoes_df, analise_df, meta,
-        diag, glosas_df, prazos_df, orfas_df,
+    meta = st.session_state.analise_meta
+    cred_slug = (meta.get("credenciado", "")[:6] or "cred").strip().replace(" ", "_")
+    stamp     = datetime.now().strftime("%Y%m%d_%H%M")
+    _render_resultado_analise(
+        nome_base=f"Analise_{cred_slug}_{stamp}",
+        key_prefix="analise_online",
     )
-    json_bytes = gerar_json_analise(envios_df, quitacoes_df, analise_df, meta)
-    cred_slug  = (meta.get("credenciado", "")[:6] or "cred").strip().replace(" ", "_")
-    stamp      = datetime.now().strftime("%Y%m%d_%H%M")
-    nome_base  = f"Analise_{cred_slug}_{stamp}"
-
-    col_x, col_j = st.columns(2)
-    with col_x:
-        st.download_button(
-            label="⬇️ Baixar XLSX",
-            data=xlsx_bytes,
-            file_name=f"{nome_base}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-            key="dl_analise_xlsx",
-        )
-    with col_j:
-        st.download_button(
-            label="⬇️ Baixar JSON (dados crus)",
-            data=json_bytes,
-            file_name=f"{nome_base}.json",
-            mime="application/json",
-            use_container_width=True,
-            key="dl_analise_json",
-        )
 
     st.markdown("<br>", unsafe_allow_html=True)
-    if st.button("← Voltar ao menu", use_container_width=True, key="voltar_analise_done", type="primary"):
+    if st.button("← Voltar ao menu", use_container_width=True,
+                 key="voltar_analise_done", type="primary"):
         limpar_pasta_tmp(st.session_state.get("analise_pasta_tmp"))
         for chave in [
             "analise_envios_df", "analise_quitacoes_df", "analise_resultado_df",
@@ -2444,112 +2461,12 @@ elif st.session_state.step == "analise_manual_upload":
 # TELA: Análise manual — resultado + downloads
 # ──────────────────────────────────────────────────────────────────
 elif st.session_state.step == "analise_manual_done":
-    analise_df   = st.session_state.analise_resultado_df
-    envios_df    = st.session_state.analise_envios_df
-    quitacoes_df = st.session_state.analise_quitacoes_df
-    glosas_df    = st.session_state.get("analise_glosas_df")
-    prazos_df    = st.session_state.get("analise_prazos_df")
-    orfas_df     = st.session_state.get("analise_orfas_df")
-    diag         = st.session_state.get("analise_diag", {})
-    meta         = st.session_state.analise_meta
-
-    if not st.session_state.get("analise_celebrou"):
-        st.balloons()
-        st.session_state["analise_celebrou"] = True
-
-    total      = len(analise_df)
-    quitadas   = int((analise_df["Status"] == "Quitada integralmente").sum())
-    parciais   = int((analise_df["Status"] == "Quitada parcial (glosa)").sum())
-    pendentes  = int((analise_df["Status"] == "Pendente").sum())
-    soma_env   = float(analise_df["Valor_Guia_Enviado"].sum())
-    soma_rec   = float(analise_df["Total_Repasse"].sum())
-    soma_dif   = float(analise_df["Diferenca"].sum())
-
-    st.success(f"✅ Análise concluída! {total} guia(s) processada(s).")
-    st.caption("Modo manual — arquivos enviados por upload.")
-
-    if diag.get("envios_duplicados"):
-        st.warning(
-            f"⚠️ {diag['envios_duplicados']} envio(s) tinham número de guia "
-            "repetido — os valores dessas guias foram somados na análise."
-        )
-
-    if orfas_df is not None and not orfas_df.empty:
-        soma_orfa = float(orfas_df["Total_Repasse"].sum())
-        st.warning(
-            f"⚠️ {len(orfas_df)} guia(s) da quitação não estão nos envios "
-            f"(provavelmente são de envios anteriores) — total recebido: "
-            f"R$ {soma_orfa:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-            + ". Veja a aba 'Quitações órfãs' no XLSX."
-        )
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total",     total)
-    c2.metric("Quitadas",  quitadas)
-    c3.metric("Parciais",  parciais)
-    c4.metric("Pendentes", pendentes)
-
-    c5, c6, c7 = st.columns(3)
-    c5.metric("Enviado (R$)",   f"{soma_env:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-    c6.metric("Recebido (R$)",  f"{soma_rec:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-    c7.metric("Diferença (R$)", f"{soma_dif:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-
-    with st.expander("🔎 Diagnóstico (colunas detectadas)"):
-        st.write({
-            "Valor da Guia (envios)":       diag.get("col_valor_envio")    or "❌ não detectada",
-            "Nº da Guia (envios)":          diag.get("col_guia_envio")     or "❌ não detectada",
-            "Nº da Guia (quitação)":        diag.get("col_guia_quitacao")  or "❌ não detectada",
-            "Valor do Repasse (quitação)":  diag.get("col_repasse")        or "❌ não detectada",
-            "Valor da Glosa (quitação)":    diag.get("col_glosa")          or "❌ não detectada",
-            "Código do Serviço (quitação)": diag.get("col_codigo")         or "❌ não detectada",
-            "Descrição do Serviço (quit.)": diag.get("col_descricao")      or "❌ não detectada",
-        })
-
-    st.markdown("---")
-    st.markdown("**Pré-visualização do resultado:**")
-    st.dataframe(analise_df, use_container_width=True, height=320)
-
-    if glosas_df is not None and not glosas_df.empty:
-        st.markdown(f"**Glosas detalhadas ({len(glosas_df)} procedimento(s) glosado(s)):**")
-        st.dataframe(glosas_df, use_container_width=True, height=240)
-
-    if prazos_df is not None and not prazos_df.empty:
-        st.markdown(f"**Prazos médios por convênio ({len(prazos_df)} convênio(s)):**")
-        st.dataframe(prazos_df, use_container_width=True, height=240)
-
-    if orfas_df is not None and not orfas_df.empty:
-        st.markdown(f"**Quitações órfãs ({len(orfas_df)} guia(s) sem envio no arquivo de envios):**")
-        st.dataframe(orfas_df, use_container_width=True, height=240)
-
-    st.markdown("---")
-    st.markdown("**Baixar resultados:**")
-    xlsx_bytes = gerar_xlsx_analise(
-        envios_df, quitacoes_df, analise_df, meta,
-        diag, glosas_df, prazos_df, orfas_df,
+    stamp = datetime.now().strftime("%Y%m%d_%H%M")
+    _render_resultado_analise(
+        nome_base=f"Analise_Manual_{stamp}",
+        contexto_label="Modo manual — arquivos enviados por upload.",
+        key_prefix="analise_manual",
     )
-    json_bytes = gerar_json_analise(envios_df, quitacoes_df, analise_df, meta)
-    stamp      = datetime.now().strftime("%Y%m%d_%H%M")
-    nome_base  = f"Analise_Manual_{stamp}"
-
-    col_x, col_j = st.columns(2)
-    with col_x:
-        st.download_button(
-            label="⬇️ Baixar XLSX",
-            data=xlsx_bytes,
-            file_name=f"{nome_base}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-            key="dl_manual_xlsx",
-        )
-    with col_j:
-        st.download_button(
-            label="⬇️ Baixar JSON (dados crus)",
-            data=json_bytes,
-            file_name=f"{nome_base}.json",
-            mime="application/json",
-            use_container_width=True,
-            key="dl_manual_json",
-        )
 
     st.markdown("<br>", unsafe_allow_html=True)
     col_n, col_v = st.columns(2)
