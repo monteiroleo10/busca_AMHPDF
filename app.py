@@ -487,16 +487,31 @@ def salvar_acompanhamento_xlsx(dados, credenciado, data_ini, data_fim):
 # ─── ANÁLISE: ENVIOS vs QUITAÇÕES ─────────────────────────────────
 
 def _encontrar_coluna(df, candidatos):
-    """Procura coluna por substring (case-insensitive), respeitando ordem de
-    prioridade dos candidatos: tenta o 1º candidato em todas as colunas, depois
-    o 2º, etc. Retorna nome da coluna ou None."""
+    """Procura coluna por nome, respeitando ordem de prioridade dos candidatos.
+    Faz duas passadas: primeiro match exato (case-insensitive), depois substring.
+    Assim "atendimento" pega "Atendimento" antes de "Carater de Atendimento"."""
     cols_norm = [(c, str(c).strip().lower()) for c in df.columns]
+    for cand in candidatos:
+        cand_norm = cand.lower()
+        for col, col_norm in cols_norm:
+            if cand_norm == col_norm:
+                return col
     for cand in candidatos:
         cand_norm = cand.lower()
         for col, col_norm in cols_norm:
             if cand_norm in col_norm:
                 return col
     return None
+
+
+def _para_data(valor):
+    """Converte string para Timestamp (DD/MM/YYYY ou similar). NaT se inválido."""
+    if pd.isna(valor) or valor in (None, ""):
+        return pd.NaT
+    try:
+        return pd.to_datetime(str(valor).strip(), dayfirst=True, errors="coerce")
+    except Exception:
+        return pd.NaT
 
 
 def _para_numero(valor):
@@ -547,10 +562,14 @@ def cruzar_envios_quitacoes(envios_df, quitacoes_df):
     col_guia_env  = _encontrar_coluna(envios_df,    ["nº da guia", "nº guia", "n guia", "num guia", "numero da guia", "guia"])
     col_valor_env = _encontrar_coluna(envios_df,    ["valor da guia", "vlr guia", "vl guia", "valor total", "vlr total"])
     col_guia_qit  = _encontrar_coluna(quitacoes_df, ["nº da guia", "nº guia", "n guia", "num guia", "numero da guia", "guia"])
-    col_repasse   = _encontrar_coluna(quitacoes_df, ["valor do repasse", "vlr repasse", "vl repasse", "repasse ao", "repasse"])
+    col_repasse   = _encontrar_coluna(quitacoes_df, ["valor do repasse", "vlr repasse", "vl repasse"])
     col_glosa     = _encontrar_coluna(quitacoes_df, ["valor da glosa", "vlr glosa", "vl glosa", "valor glosa", "glosa"])
     col_codigo    = _encontrar_coluna(quitacoes_df, ["código do serviço", "codigo do servico", "código", "codigo", "procedimento"])
     col_desc      = _encontrar_coluna(quitacoes_df, ["descrição do serviço", "descricao do servico", "descrição", "descricao"])
+    col_convenio  = _encontrar_coluna(quitacoes_df, ["nome do convênio", "nome do convenio", "convênio", "convenio"])
+    col_dt_atend  = _encontrar_coluna(quitacoes_df, ["atendimento"])
+    col_dt_envio  = _encontrar_coluna(quitacoes_df, ["entrega na amhp", "entrega amhp"])
+    col_dt_repas  = _encontrar_coluna(quitacoes_df, ["repasse ao associado", "data do repasse"])
 
     if not col_guia_env:
         raise ValueError("Não consegui identificar a coluna de número da guia nos envios.")
@@ -630,11 +649,70 @@ def cruzar_envios_quitacoes(envios_df, quitacoes_df):
         "col_glosa":          col_glosa,
         "col_codigo":         col_codigo,
         "col_descricao":      col_desc,
+        "col_convenio":       col_convenio,
+        "col_data_atend":     col_dt_atend,
+        "col_data_envio_amhp": col_dt_envio,
+        "col_data_repasse":   col_dt_repas,
         "qtd_envios_total":   qtd_envios_total,
         "qtd_guias_unicas":   qtd_guias_unicas,
         "envios_duplicados":  duplicadas,
     }
     return resultado, diag
+
+
+def tabela_prazos_por_convenio(quitacoes_df, diag):
+    """Calcula prazos médios em dias por convênio:
+       - Envio  = Entrega na AMHP - Atendimento
+       - Repasse = Repasse ao Associado - Entrega na AMHP
+       - Total  = Envio + Repasse
+    Retorna DataFrame ou DF vazio se faltar coluna essencial."""
+    col_conv  = diag.get("col_convenio")
+    col_atend = diag.get("col_data_atend")
+    col_envio = diag.get("col_data_envio_amhp")
+    col_repas = diag.get("col_data_repasse")
+
+    if not (col_conv and col_atend and col_envio and col_repas):
+        return pd.DataFrame(columns=[
+            "Nome do Convenio", "Prazo Medio Envio (dias)",
+            "Prazo Medio Repasse (dias)", "Prazo Medio Total (dias)",
+            "Qtd Procedimentos",
+        ])
+
+    df = quitacoes_df.copy()
+    df["__dt_atend"] = df[col_atend].apply(_para_data)
+    df["__dt_envio"] = df[col_envio].apply(_para_data)
+    df["__dt_repas"] = df[col_repas].apply(_para_data)
+    df["__prazo_envio"]   = (df["__dt_envio"] - df["__dt_atend"]).dt.days
+    df["__prazo_repasse"] = (df["__dt_repas"] - df["__dt_envio"]).dt.days
+
+    df["__convenio_norm"] = df[col_conv].astype(str).str.strip()
+    df = df[df["__convenio_norm"] != ""]
+
+    agg = df.groupby("__convenio_norm", dropna=False).agg(
+        prazo_envio_medio=("__prazo_envio",   "mean"),
+        prazo_repasse_medio=("__prazo_repasse", "mean"),
+        qtd=("__convenio_norm", "size"),
+    ).reset_index()
+
+    agg["prazo_envio_medio"]   = agg["prazo_envio_medio"].round(1)
+    agg["prazo_repasse_medio"] = agg["prazo_repasse_medio"].round(1)
+    agg["prazo_total_medio"]   = (agg["prazo_envio_medio"].fillna(0) +
+                                  agg["prazo_repasse_medio"].fillna(0)).round(1)
+
+    agg = agg.rename(columns={
+        "__convenio_norm":     "Nome do Convenio",
+        "prazo_envio_medio":   "Prazo Medio Envio (dias)",
+        "prazo_repasse_medio": "Prazo Medio Repasse (dias)",
+        "prazo_total_medio":   "Prazo Medio Total (dias)",
+        "qtd":                 "Qtd Procedimentos",
+    })
+
+    agg = agg[[
+        "Nome do Convenio", "Prazo Medio Envio (dias)",
+        "Prazo Medio Repasse (dias)", "Prazo Medio Total (dias)",
+        "Qtd Procedimentos",
+    ]].sort_values("Nome do Convenio").reset_index(drop=True)
+    return agg
 
 
 def tabela_glosas(quitacoes_df, diag):
@@ -662,9 +740,9 @@ def tabela_glosas(quitacoes_df, diag):
     return out
 
 
-def gerar_xlsx_analise(envios_df, quitacoes_df, analise_df, meta, diag=None, glosas_df=None):
-    """Gera o XLSX da análise em memória (bytes) com até 5 abas: Resumo,
-    Análise, Glosas, Envios, Quitações. Converte as colunas numéricas-chave
+def gerar_xlsx_analise(envios_df, quitacoes_df, analise_df, meta, diag=None, glosas_df=None, prazos_df=None):
+    """Gera o XLSX da análise em memória (bytes) com até 6 abas: Resumo,
+    Análise, Glosas, Prazos, Envios, Quitações. Converte as colunas numéricas-chave
     pra float nas abas Envios/Quitações pra permitir SOMA() no Excel."""
     diag = diag or {}
     envios_export    = envios_df.copy()
@@ -707,6 +785,8 @@ def gerar_xlsx_analise(envios_df, quitacoes_df, analise_df, meta, diag=None, glo
         analise_df.to_excel(writer,    sheet_name="Análise",   index=False)
         if glosas_df is not None and not glosas_df.empty:
             glosas_df.to_excel(writer, sheet_name="Glosas",    index=False)
+        if prazos_df is not None and not prazos_df.empty:
+            prazos_df.to_excel(writer, sheet_name="Prazos",    index=False)
         envios_export.to_excel(writer,    sheet_name="Envios",    index=False)
         quitacoes_export.to_excel(writer, sheet_name="Quitações", index=False)
     return buf.getvalue()
@@ -1926,12 +2006,14 @@ elif st.session_state.step == "analise_processando":
             quitacoes_df       = quitacoes_para_df(csv_paths)
             analise_df, diag   = cruzar_envios_quitacoes(envios_df, quitacoes_df)
             glosas_df          = tabela_glosas(quitacoes_df, diag)
+            prazos_df          = tabela_prazos_por_convenio(quitacoes_df, diag)
 
             st.session_state.analise_envios_df    = envios_df
             st.session_state.analise_quitacoes_df = quitacoes_df
             st.session_state.analise_resultado_df = analise_df
             st.session_state.analise_diag         = diag
             st.session_state.analise_glosas_df    = glosas_df
+            st.session_state.analise_prazos_df    = prazos_df
             st.session_state.analise_pasta_tmp    = pasta_tmp
             st.session_state.step = "analise_done"
         except Exception as e:
@@ -1950,6 +2032,7 @@ elif st.session_state.step == "analise_done":
     envios_df    = st.session_state.analise_envios_df
     quitacoes_df = st.session_state.analise_quitacoes_df
     glosas_df    = st.session_state.get("analise_glosas_df")
+    prazos_df    = st.session_state.get("analise_prazos_df")
     diag         = st.session_state.get("analise_diag", {})
     meta         = st.session_state.analise_meta
 
@@ -2003,9 +2086,13 @@ elif st.session_state.step == "analise_done":
         st.markdown(f"**Glosas detalhadas ({len(glosas_df)} procedimento(s) glosado(s)):**")
         st.dataframe(glosas_df, use_container_width=True, height=240)
 
+    if prazos_df is not None and not prazos_df.empty:
+        st.markdown(f"**Prazos médios por convênio ({len(prazos_df)} convênio(s)):**")
+        st.dataframe(prazos_df, use_container_width=True, height=240)
+
     st.markdown("---")
     st.markdown("**Baixar resultados:**")
-    xlsx_bytes = gerar_xlsx_analise(envios_df, quitacoes_df, analise_df, meta, diag, glosas_df)
+    xlsx_bytes = gerar_xlsx_analise(envios_df, quitacoes_df, analise_df, meta, diag, glosas_df, prazos_df)
     json_bytes = gerar_json_analise(envios_df, quitacoes_df, analise_df, meta)
     cred_slug  = (meta.get("credenciado", "")[:6] or "cred").strip().replace(" ", "_")
     stamp      = datetime.now().strftime("%Y%m%d_%H%M")
@@ -2036,7 +2123,7 @@ elif st.session_state.step == "analise_done":
         limpar_pasta_tmp(st.session_state.get("analise_pasta_tmp"))
         for chave in [
             "analise_envios_df", "analise_quitacoes_df", "analise_resultado_df",
-            "analise_glosas_df", "analise_diag",
+            "analise_glosas_df", "analise_prazos_df", "analise_diag",
             "analise_meta", "analise_pasta_tmp", "analise_refs", "analise_celebrou",
         ]:
             st.session_state.pop(chave, None)
