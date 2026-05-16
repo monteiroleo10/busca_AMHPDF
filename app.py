@@ -13,15 +13,18 @@ import threading
 import queue
 import os
 import glob
+import io
 import json
 import platform
+import tempfile
 import time
 import re
 import urllib.parse
 import base64
 import pandas as pd
 import openpyxl
-from datetime import date
+from openpyxl.utils import get_column_letter
+from datetime import date, datetime
 from playwright.sync_api import sync_playwright
 
 
@@ -38,6 +41,11 @@ URL_PORTAL          = "https://portal.amhp.com.br/"
 URL_PERFIL          = "https://portal.amhp.com.br/pages/PJ/perfil.html"
 URL_EXTRATO         = "https://amhptiss.amhp.com.br/Extrato.aspx"
 URL_ACOMPANHAMENTO  = "https://amhptiss.amhp.com.br/AcompanhamentoAtendimentoDigital.aspx"
+
+# Portal AMHP só tem dados de envios digitais a partir desta data.
+# Datas anteriores retornam vazio mesmo quando a guia foi enviada
+# (via outro meio que não o digital).
+DATA_MINIMA_ENVIOS_DIGITAIS = date(2025, 6, 5)
 
 CONFIG_FILE = os.path.join(
     os.path.expanduser("~"), ".amhp_app_config.json"
@@ -252,8 +260,7 @@ def obter_credenciados_disponiveis(page, log_queue):
     except Exception:
         pass
 
-    page.goto(URL_ACOMPANHAMENTO)
-    page.wait_for_load_state("domcontentloaded")
+    page.goto(URL_ACOMPANHAMENTO, wait_until="domcontentloaded", timeout=120000)
     page.wait_for_selector("#ctl00_MainContent_rcbCredenciado_Input", timeout=30000)
     page.locator("#ctl00_MainContent_rcbCredenciado_Input").click()
     page.wait_for_selector(
@@ -294,9 +301,9 @@ def selecionar_credenciado_no_dropdown(page, credenciado, prefixo_id):
 
 def navegar_para_extrato(page, credenciado, log_queue):
     """Vai para a página de Extrato e seleciona o credenciado."""
-    page.goto(URL_EXTRATO)
-    # DOM pronto basta — temos waits específicos abaixo.
-    page.wait_for_load_state("domcontentloaded")
+    # Timeout generoso: depois de uma busca grande, o portal AMHP pode
+    # demorar mais que os 30s padrao do Playwright para carregar a página.
+    page.goto(URL_EXTRATO, wait_until="domcontentloaded", timeout=120000)
 
     try:
         page.wait_for_selector("#ctl00_MainContent_rcbCredenciado_Input", timeout=5000)
@@ -347,10 +354,11 @@ def selecionar_referencia(page, texto_referencia):
         pass
 
 
-def exportar_csv(page, texto_referencia, usuario):
+def exportar_csv(page, texto_referencia, usuario, pasta_destino=None):
     selecionar_referencia(page, texto_referencia)
     page.locator("#ctl00_MainContent_rbtExportarCsv_input").click()
 
+    destino = pasta_destino or PASTA_DESTINO
     caminho = None
     try:
         # Espera o iframe do popup aparecer — substitui a antiga pausa fixa de 2s.
@@ -372,7 +380,7 @@ def exportar_csv(page, texto_referencia, usuario):
             popup.locator("#rbtExportarCsv_input").click(timeout=10000)
 
         download = dl.value
-        os.makedirs(PASTA_DESTINO, exist_ok=True)
+        os.makedirs(destino, exist_ok=True)
         prefixo = ''.join(c for c in usuario if c.isdigit())[:6]
         nome = (prefixo + "_Extrato_"
                 + texto_referencia
@@ -381,7 +389,7 @@ def exportar_csv(page, texto_referencia, usuario):
                   .replace("â", "a").replace("ó", "o").replace("ô", "o")
                   .replace("ú", "u").replace("/", "_").replace(" ", "_")
                 + ".csv")
-        caminho = os.path.join(PASTA_DESTINO, nome)
+        caminho = os.path.join(destino, nome)
         download.save_as(caminho)
     finally:
         page.evaluate("document.querySelectorAll('[id^=\"RadWindowWrapper_\"], .TelerikModalOverlay').forEach(el => el.remove())")
@@ -409,7 +417,7 @@ def consolidar_excel(arquivos, usuario):
 
 def buscar_acompanhamento(page, data_ini, data_fim, credenciado, log_queue):
     log_queue.put("Navegando para a página de envios digitais...")
-    page.goto(URL_ACOMPANHAMENTO)
+    page.goto(URL_ACOMPANHAMENTO, wait_until="domcontentloaded", timeout=120000)
     page.wait_for_selector("#ctl00_MainContent_rdpDataInicio_dateInput", timeout=20000)
 
     log_queue.put("Preenchendo filtros...")
@@ -429,27 +437,72 @@ def buscar_acompanhamento(page, data_ini, data_fim, credenciado, log_queue):
 
     log_queue.put("Executando busca...")
     page.locator("#ctl00_MainContent_btnBuscarAtendimentos_input").click()
+    # Para períodos longos a AMHP pode demorar muito pra processar.
+    # Damos uma janela generosa pro overlay de loading sumir.
     try:
-        page.wait_for_selector(".raDiv", state="hidden", timeout=30000)
+        page.wait_for_selector(".raDiv", state="hidden", timeout=300000)  # 5 min
     except Exception:
-        pass
-    # Pausa defensiva para a tabela popular após a busca. A AMHP renderiza
-    # o cabecalho da tabela antes dos dados chegarem, entao um wait_for_selector
-    # por <tr> retornaria cedo demais e a leitura viria vazia.
-    page.wait_for_timeout(2000)
+        log_queue.put("⚠️ Indicador de carregamento não sumiu em 5 min, tentando extrair mesmo assim.")
+
+    # Em vez de uma pausa fixa, espera ativamente a tabela popular (linha com
+    # dados) OU a mensagem de "nenhum registro". Sai antes se um dos dois aparece.
+    log_queue.put("Aguardando tabela popular...")
+    try:
+        page.wait_for_function(
+            """() => {
+                const tabela = document.querySelector(
+                    '#ctl00_MainContent_rdgAcompanhamentoDigital'
+                );
+                if (!tabela) return false;
+                // Linha de dados (td com conteúdo)
+                const linhas = tabela.querySelectorAll(
+                    'table.rgMasterTable tbody tr'
+                );
+                for (const tr of linhas) {
+                    const tds = tr.querySelectorAll('td');
+                    if (tds.length > 0) {
+                        for (const td of tds) {
+                            if ((td.innerText || '').trim() !== '') return true;
+                        }
+                    }
+                }
+                // Ou mensagem de "sem registros" do Telerik
+                if (tabela.querySelector('.rgNoRecords, .rgEmptyData')) return true;
+                return false;
+            }""",
+            timeout=300000,  # 5 min
+        )
+    except Exception:
+        log_queue.put("⚠️ Tabela demorou para popular, tentando extrair mesmo assim.")
+    # Pequena margem após o sinal de pronto.
+    page.wait_for_timeout(500)
 
     log_queue.put("Extraindo dados da tabela...")
     # Extracao em UMA chamada ao navegador (em vez de uma por celula).
-    # Acelera dramaticamente quando a tabela tem muitas linhas.
+    # Ignora linhas de "Nenhum registro" do Telerik e linhas-mensagem
+    # (1 célula com colSpan grande), que antes eram contadas como dado válido.
     dados = page.evaluate("""() => {
-        const rows = Array.from(document.querySelectorAll(
-            '#ctl00_MainContent_rdgAcompanhamentoDigital table.rgMasterTable tr'
-        ));
-        return rows.map(row =>
-            Array.from(row.querySelectorAll('th, td'))
-                 .map(c => (c.innerText || '').trim())
-        ).filter(row => row.some(cell => cell.length > 0));
+        const grid = document.querySelector('#ctl00_MainContent_rdgAcompanhamentoDigital');
+        if (!grid) return [];
+        const tabela = grid.querySelector('table.rgMasterTable');
+        if (!tabela) return [];
+        const linhas = Array.from(tabela.querySelectorAll('tr'));
+        const out = [];
+        for (const tr of linhas) {
+            if (tr.classList && (
+                tr.classList.contains('rgNoRecords') ||
+                tr.classList.contains('rgEmptyData')
+            )) continue;
+            const celulas = Array.from(tr.querySelectorAll('th, td'));
+            if (celulas.length === 0) continue;
+            // Linha-mensagem (1 célula esticada por colSpan) — não é dado.
+            if (celulas.length === 1 && celulas[0].colSpan && celulas[0].colSpan > 1) continue;
+            const row = celulas.map(c => (c.innerText || '').trim());
+            if (row.some(c => c.length > 0)) out.push(row);
+        }
+        return out;
     }""")
+    log_queue.put(f"Tabela retornou {len(dados)} linha(s) (incluindo cabeçalho).")
     return dados or []
 
 
@@ -479,6 +532,447 @@ def salvar_acompanhamento_xlsx(dados, credenciado, data_ini, data_fim):
         ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 50)
     wb.save(nome_arq)
     return nome_arq
+
+
+# ─── ANÁLISE: ENVIOS vs QUITAÇÕES ─────────────────────────────────
+
+def _encontrar_coluna(df, candidatos):
+    """Procura coluna por nome, respeitando ordem de prioridade dos candidatos.
+    Faz duas passadas: primeiro match exato (case-insensitive), depois substring.
+    Assim "atendimento" pega "Atendimento" antes de "Carater de Atendimento"."""
+    cols_norm = [(c, str(c).strip().lower()) for c in df.columns]
+    for cand in candidatos:
+        cand_norm = cand.lower()
+        for col, col_norm in cols_norm:
+            if cand_norm == col_norm:
+                return col
+    for cand in candidatos:
+        cand_norm = cand.lower()
+        for col, col_norm in cols_norm:
+            if cand_norm in col_norm:
+                return col
+    return None
+
+
+def _para_data(valor):
+    """Converte string para Timestamp (DD/MM/YYYY ou similar). NaT se inválido."""
+    if pd.isna(valor) or valor in (None, ""):
+        return pd.NaT
+    try:
+        return pd.to_datetime(str(valor).strip(), dayfirst=True, errors="coerce")
+    except Exception:
+        return pd.NaT
+
+
+def _aplicar_formato_data_xlsx(writer, sheet_name, df):
+    """Em colunas datetime do DF, aplica número_format DD/MM/YYYY na worksheet."""
+    ws = writer.sheets.get(sheet_name)
+    if ws is None:
+        return
+    for col_idx, col_name in enumerate(df.columns, start=1):
+        if pd.api.types.is_datetime64_any_dtype(df[col_name]):
+            letter = get_column_letter(col_idx)
+            for row in range(2, len(df) + 2):
+                ws[f"{letter}{row}"].number_format = "DD/MM/YYYY"
+
+
+def _converter_colunas_data(df, limiar_taxa_sucesso=0.5):
+    """Detecta heuristicamente colunas que parecem datas (pelo nome) e as
+    converte para datetime. Só efetiva a conversão se pelo menos
+    `limiar_taxa_sucesso` das células viraram data válida (evita transformar
+    "Carater de Atendimento" em data quando o nome bate por coincidência)."""
+    if df is None or df.empty:
+        return df
+    candidatos = ["data", "atendimento", "entrega", "repasse ao", "realização", "realizacao"]
+    df = df.copy()
+    for col in df.columns:
+        col_norm = str(col).strip().lower()
+        if not any(c in col_norm for c in candidatos):
+            continue
+        convertido = df[col].apply(_para_data)
+        sucesso = convertido.notna().sum()
+        total   = len(df)
+        if total > 0 and sucesso >= limiar_taxa_sucesso * total:
+            df[col] = convertido
+    return df
+
+
+def _para_numero(valor):
+    """Converte string monetária brasileira em float; retorna 0.0 se inválido."""
+    if pd.isna(valor) or valor in (None, ""):
+        return 0.0
+    s = str(valor).strip().replace("R$", "").replace(" ", "")
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s:
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
+def envios_para_df(envios_raw):
+    """Converte a lista de listas vinda da página de Acompanhamento em DataFrame."""
+    if not envios_raw or len(envios_raw) < 2:
+        return pd.DataFrame()
+    header = envios_raw[0]
+    return pd.DataFrame(envios_raw[1:], columns=header)
+
+
+def quitacoes_para_df(csv_paths):
+    """Lê e concatena os CSVs de quitação em um único DataFrame."""
+    frames = []
+    for arq in csv_paths:
+        try:
+            df = pd.read_csv(arq, sep=";", encoding="latin1", dtype=str)
+            df["__Referencia"] = os.path.basename(arq).replace(".csv", "")
+            frames.append(df)
+        except Exception:
+            pass
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def ler_arquivo_para_df(uploaded_file):
+    """Lê um arquivo do upload (XLSX, XLS ou CSV) e retorna DataFrame.
+    Para CSV tenta combinações comuns de separador e encoding (formato AMHP
+    usa ;/latin1, mas Excel pode exportar como ,/utf-8)."""
+    nome = uploaded_file.name.lower()
+    if nome.endswith((".xlsx", ".xls")):
+        uploaded_file.seek(0)
+        return pd.read_excel(uploaded_file, dtype=str)
+    if nome.endswith(".csv"):
+        melhor = None
+        for enc in ["latin1", "utf-8", "utf-8-sig"]:
+            for sep in [";", ","]:
+                try:
+                    uploaded_file.seek(0)
+                    df = pd.read_csv(uploaded_file, sep=sep, encoding=enc, dtype=str)
+                    if melhor is None or len(df.columns) > len(melhor.columns):
+                        melhor = df
+                except Exception:
+                    continue
+        if melhor is not None:
+            return melhor
+        raise ValueError(f"Não consegui ler o CSV {uploaded_file.name}.")
+    raise ValueError(f"Formato não suportado: {uploaded_file.name}")
+
+
+def cruzar_envios_quitacoes(envios_df, quitacoes_df):
+    """
+    Cruza por número da guia. Retorna (analise_df, diag) onde:
+      analise_df tem Numero_Guia, Status, Valor_Guia_Enviado, Total_Repasse,
+                 Diferenca, Total_Glosa, Qtd_Procedimentos, Detalhe_Glosas
+      diag       tem nomes das colunas detectadas e contadores de duplicatas
+    """
+    col_guia_env  = _encontrar_coluna(envios_df,    ["nº da guia", "nº guia", "n guia", "num guia", "numero da guia", "guia"])
+    col_valor_env = _encontrar_coluna(envios_df,    ["valor da guia", "vlr guia", "vl guia", "valor total", "vlr total"])
+    col_guia_qit  = _encontrar_coluna(quitacoes_df, ["nº da guia", "nº guia", "n guia", "num guia", "numero da guia", "guia"])
+    col_repasse   = _encontrar_coluna(quitacoes_df, ["valor do repasse", "vlr repasse", "vl repasse"])
+    col_glosa     = _encontrar_coluna(quitacoes_df, ["valor da glosa", "vlr glosa", "vl glosa", "valor glosa", "glosa"])
+    col_codigo    = _encontrar_coluna(quitacoes_df, ["código do serviço", "codigo do servico", "código", "codigo", "procedimento"])
+    col_desc      = _encontrar_coluna(quitacoes_df, ["descrição do serviço", "descricao do servico", "descrição", "descricao"])
+    col_convenio  = _encontrar_coluna(quitacoes_df, ["nome do convênio", "nome do convenio", "convênio", "convenio"])
+    col_dt_atend  = _encontrar_coluna(quitacoes_df, ["atendimento"])
+    col_dt_envio  = _encontrar_coluna(quitacoes_df, ["entrega na amhp", "entrega amhp"])
+    col_dt_repas  = _encontrar_coluna(quitacoes_df, ["repasse ao associado", "data do repasse"])
+
+    if not col_guia_env:
+        raise ValueError("Não consegui identificar a coluna de número da guia nos envios.")
+    if not col_guia_qit:
+        raise ValueError("Não consegui identificar a coluna de número da guia nas quitações.")
+
+    envios_df    = envios_df.copy()
+    quitacoes_df = quitacoes_df.copy()
+    envios_df["__guia"]    = envios_df[col_guia_env].astype(str).str.strip()
+    quitacoes_df["__guia"] = quitacoes_df[col_guia_qit].astype(str).str.strip()
+
+    envios_df["__valor_guia"] = envios_df[col_valor_env].apply(_para_numero) if col_valor_env else 0.0
+    quitacoes_df["__repasse"] = quitacoes_df[col_repasse].apply(_para_numero) if col_repasse else 0.0
+    quitacoes_df["__glosa"]   = quitacoes_df[col_glosa].apply(_para_numero)   if col_glosa   else 0.0
+
+    qtd_envios_total = len(envios_df)
+    qtd_guias_unicas = envios_df["__guia"].nunique()
+    duplicadas       = qtd_envios_total - qtd_guias_unicas
+
+    agg_quit = quitacoes_df.groupby("__guia").agg(
+        Total_Repasse=("__repasse", "sum"),
+        Total_Glosa=("__glosa", "sum"),
+        Qtd_Procedimentos=("__guia", "size"),
+    ).reset_index()
+
+    # Detalhe das glosas: só procedimentos com glosa > 0
+    detalhes_glosas = {}
+    com_glosa = quitacoes_df[quitacoes_df["__glosa"] > 0.001]
+    for guia, grupo in com_glosa.groupby("__guia"):
+        partes = []
+        for _, r in grupo.iterrows():
+            codigo   = str(r[col_codigo]).strip() if col_codigo else ""
+            desc     = str(r[col_desc]).strip()   if col_desc   else ""
+            etiqueta = " ".join(p for p in [codigo, desc] if p)
+            valor    = r["__glosa"]
+            valor_fmt = f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+            partes.append(f"{etiqueta}: {valor_fmt}" if etiqueta else valor_fmt)
+        detalhes_glosas[guia] = " | ".join(partes)
+
+    # Agrupa envios por guia somando o valor (em vez de drop_duplicates).
+    # Assim, se a mesma guia aparece em mais de um envio, soma os valores;
+    # a soma da aba Envios bate com a soma da Análise.
+    envios_agg = envios_df.groupby("__guia").agg(
+        Valor_Guia_Enviado=("__valor_guia", "sum"),
+    ).reset_index().rename(columns={"__guia": "Numero_Guia"})
+
+    resultado = envios_agg.merge(
+        agg_quit.rename(columns={"__guia": "Numero_Guia"}),
+        on="Numero_Guia", how="left",
+    )
+
+    resultado["Total_Repasse"]     = resultado["Total_Repasse"].fillna(0.0)
+    resultado["Total_Glosa"]       = resultado["Total_Glosa"].fillna(0.0)
+    resultado["Qtd_Procedimentos"] = resultado["Qtd_Procedimentos"].fillna(0).astype(int)
+    resultado["Diferenca"]         = resultado["Valor_Guia_Enviado"] - resultado["Total_Repasse"]
+    resultado["Detalhe_Glosas"]    = resultado["Numero_Guia"].map(detalhes_glosas).fillna("")
+
+    def _classificar(row):
+        if row["Qtd_Procedimentos"] == 0:
+            return "Pendente"
+        if abs(row["Diferenca"]) <= 0.01:
+            return "Quitada integralmente"
+        return "Quitada parcial (glosa)"
+
+    resultado["Status"] = resultado.apply(_classificar, axis=1)
+
+    resultado = resultado[[
+        "Numero_Guia", "Status", "Valor_Guia_Enviado", "Total_Repasse",
+        "Diferenca", "Total_Glosa", "Qtd_Procedimentos", "Detalhe_Glosas",
+    ]]
+
+    diag = {
+        "col_guia_envio":     col_guia_env,
+        "col_valor_envio":    col_valor_env,
+        "col_guia_quitacao":  col_guia_qit,
+        "col_repasse":        col_repasse,
+        "col_glosa":          col_glosa,
+        "col_codigo":         col_codigo,
+        "col_descricao":      col_desc,
+        "col_convenio":       col_convenio,
+        "col_data_atend":     col_dt_atend,
+        "col_data_envio_amhp": col_dt_envio,
+        "col_data_repasse":   col_dt_repas,
+        "qtd_envios_total":   qtd_envios_total,
+        "qtd_guias_unicas":   qtd_guias_unicas,
+        "envios_duplicados":  duplicadas,
+    }
+    return resultado, diag
+
+
+def tabela_prazos_por_convenio(quitacoes_df, diag):
+    """Calcula prazos médios em dias por convênio:
+       - Envio  = Entrega na AMHP - Atendimento
+       - Repasse = Repasse ao Associado - Entrega na AMHP
+       - Total  = Envio + Repasse
+    Retorna DataFrame ou DF vazio se faltar coluna essencial."""
+    col_conv  = diag.get("col_convenio")
+    col_atend = diag.get("col_data_atend")
+    col_envio = diag.get("col_data_envio_amhp")
+    col_repas = diag.get("col_data_repasse")
+
+    if not (col_conv and col_atend and col_envio and col_repas):
+        return pd.DataFrame(columns=[
+            "Nome do Convenio", "Prazo Medio Envio (dias)",
+            "Prazo Medio Repasse (dias)", "Prazo Medio Total (dias)",
+            "Qtd Procedimentos",
+        ])
+
+    df = quitacoes_df.copy()
+    df["__dt_atend"] = df[col_atend].apply(_para_data)
+    df["__dt_envio"] = df[col_envio].apply(_para_data)
+    df["__dt_repas"] = df[col_repas].apply(_para_data)
+    df["__prazo_envio"]   = (df["__dt_envio"] - df["__dt_atend"]).dt.days
+    df["__prazo_repasse"] = (df["__dt_repas"] - df["__dt_envio"]).dt.days
+
+    df["__convenio_norm"] = df[col_conv].astype(str).str.strip()
+    df = df[df["__convenio_norm"] != ""]
+
+    agg = df.groupby("__convenio_norm", dropna=False).agg(
+        prazo_envio_medio=("__prazo_envio",   "mean"),
+        prazo_repasse_medio=("__prazo_repasse", "mean"),
+        qtd=("__convenio_norm", "size"),
+    ).reset_index()
+
+    agg["prazo_envio_medio"]   = agg["prazo_envio_medio"].round(1)
+    agg["prazo_repasse_medio"] = agg["prazo_repasse_medio"].round(1)
+    agg["prazo_total_medio"]   = (agg["prazo_envio_medio"].fillna(0) +
+                                  agg["prazo_repasse_medio"].fillna(0)).round(1)
+
+    agg = agg.rename(columns={
+        "__convenio_norm":     "Nome do Convenio",
+        "prazo_envio_medio":   "Prazo Medio Envio (dias)",
+        "prazo_repasse_medio": "Prazo Medio Repasse (dias)",
+        "prazo_total_medio":   "Prazo Medio Total (dias)",
+        "qtd":                 "Qtd Procedimentos",
+    })
+
+    agg = agg[[
+        "Nome do Convenio", "Prazo Medio Envio (dias)",
+        "Prazo Medio Repasse (dias)", "Prazo Medio Total (dias)",
+        "Qtd Procedimentos",
+    ]].sort_values("Nome do Convenio").reset_index(drop=True)
+    return agg
+
+
+def tabela_orfas(quitacoes_df, envios_df, diag):
+    """Retorna DataFrame com guias que aparecem nas quitações mas não estão
+    nos envios do período filtrado (foram enviadas antes). Uma linha por guia,
+    agregando repasse e glosa dos procedimentos. Retorna DF vazio se não houver."""
+    col_guia_qit  = diag.get("col_guia_quitacao")
+    col_guia_env  = diag.get("col_guia_envio")
+    col_repasse   = diag.get("col_repasse")
+    col_glosa     = diag.get("col_glosa")
+    col_convenio  = diag.get("col_convenio")
+
+    if not col_guia_qit or not col_guia_env:
+        return pd.DataFrame()
+
+    guias_envio = set(envios_df[col_guia_env].astype(str).str.strip().unique())
+
+    df = quitacoes_df.copy()
+    df["__guia"]    = df[col_guia_qit].astype(str).str.strip()
+    df["__repasse"] = df[col_repasse].apply(_para_numero) if col_repasse else 0.0
+    df["__glosa"]   = df[col_glosa].apply(_para_numero)   if col_glosa   else 0.0
+    df["__convenio"] = df[col_convenio].astype(str).str.strip() if col_convenio else ""
+
+    orfas = df[~df["__guia"].isin(guias_envio)]
+    if orfas.empty:
+        return pd.DataFrame(columns=[
+            "Numero_Guia", "Nome_Convenio", "Total_Repasse",
+            "Total_Glosa", "Qtd_Procedimentos",
+        ])
+
+    agg = orfas.groupby("__guia").agg(
+        Nome_Convenio=("__convenio", "first"),
+        Total_Repasse=("__repasse", "sum"),
+        Total_Glosa=("__glosa", "sum"),
+        Qtd_Procedimentos=("__guia", "size"),
+    ).reset_index().rename(columns={"__guia": "Numero_Guia"})
+
+    return agg[[
+        "Numero_Guia", "Nome_Convenio", "Total_Repasse",
+        "Total_Glosa", "Qtd_Procedimentos",
+    ]].sort_values("Numero_Guia").reset_index(drop=True)
+
+
+def tabela_glosas(quitacoes_df, diag):
+    """Retorna DataFrame com 1 linha por procedimento glosado (Valor Glosa > 0)."""
+    col_guia   = diag.get("col_guia_quitacao")
+    col_glosa  = diag.get("col_glosa")
+    col_codigo = diag.get("col_codigo")
+    col_desc   = diag.get("col_descricao")
+
+    if not col_glosa:
+        return pd.DataFrame(columns=["Numero_Guia", "Codigo", "Descricao", "Valor_Glosa"])
+
+    df = quitacoes_df.copy()
+    df["__glosa_num"] = df[col_glosa].apply(_para_numero)
+    df = df[df["__glosa_num"] > 0.001]
+    if df.empty:
+        return pd.DataFrame(columns=["Numero_Guia", "Codigo", "Descricao", "Valor_Glosa"])
+
+    out = pd.DataFrame({
+        "Numero_Guia": df[col_guia].astype(str).str.strip() if col_guia else "",
+        "Codigo":      df[col_codigo].astype(str).str.strip() if col_codigo else "",
+        "Descricao":   df[col_desc].astype(str).str.strip()   if col_desc   else "",
+        "Valor_Glosa": df["__glosa_num"],
+    }).reset_index(drop=True)
+    return out
+
+
+def gerar_xlsx_analise(envios_df, quitacoes_df, analise_df, meta, diag=None,
+                       glosas_df=None, prazos_df=None, orfas_df=None):
+    """Gera o XLSX da análise em memória (bytes) com até 7 abas: Resumo,
+    Análise, Glosas, Prazos, Quitações órfãs, Envios, Quitações. Converte
+    colunas numéricas-chave pra float nas abas Envios/Quitações pra permitir
+    SOMA() no Excel."""
+    diag = diag or {}
+    envios_export    = envios_df.copy()
+    quitacoes_export = quitacoes_df.copy()
+
+    # Converte colunas numéricas pra float (assim somam direito no Excel)
+    cv = diag.get("col_valor_envio")
+    if cv and cv in envios_export.columns:
+        envios_export[cv] = envios_export[cv].apply(_para_numero)
+    for c in [diag.get("col_repasse"), diag.get("col_glosa")]:
+        if c and c in quitacoes_export.columns:
+            quitacoes_export[c] = quitacoes_export[c].apply(_para_numero)
+
+    # Converte colunas que são datas pra datetime (Excel reconhece como data)
+    envios_export    = _converter_colunas_data(envios_export)
+    quitacoes_export = _converter_colunas_data(quitacoes_export)
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        resumo = pd.DataFrame([
+            ["Credenciado",              meta.get("credenciado", "")],
+            ["Período de envio",         f"{meta.get('data_ini', '')} a {meta.get('data_fim', '')}"],
+            ["Referências de quitação",  ", ".join(meta.get("refs_quitacao", []))],
+            ["Gerado em",                meta.get("gerado_em", "")],
+            ["", ""],
+            ["Total de guias enviadas",      len(analise_df)],
+            ["Quitadas integralmente",       int((analise_df["Status"] == "Quitada integralmente").sum())],
+            ["Quitadas parcial (glosa)",     int((analise_df["Status"] == "Quitada parcial (glosa)").sum())],
+            ["Pendentes",                    int((analise_df["Status"] == "Pendente").sum())],
+            ["Valor total enviado (R$)",     round(float(analise_df["Valor_Guia_Enviado"].sum()), 2)],
+            ["Valor total recebido (R$)",    round(float(analise_df["Total_Repasse"].sum()), 2)],
+            ["Total glosado (R$)",           round(float(analise_df["Total_Glosa"].sum()), 2)],
+            ["Diferença total (R$)",         round(float(analise_df["Diferenca"].sum()), 2)],
+            ["", ""],
+            ["— Diagnóstico —", ""],
+            ["Coluna de Valor da Guia (envios)",     diag.get("col_valor_envio") or "(não detectada)"],
+            ["Coluna de Valor do Repasse (quit.)",   diag.get("col_repasse")     or "(não detectada)"],
+            ["Coluna de Valor da Glosa (quit.)",     diag.get("col_glosa")       or "(não detectada)"],
+            ["Linhas no relatório de envios",        diag.get("qtd_envios_total", 0)],
+            ["Guias únicas após agregação",          diag.get("qtd_guias_unicas", 0)],
+            ["Envios duplicados (mesma guia repete)", diag.get("envios_duplicados", 0)],
+        ], columns=["Campo", "Valor"])
+        resumo.to_excel(writer,        sheet_name="Resumo",    index=False)
+        analise_df.to_excel(writer,    sheet_name="Análise",   index=False)
+        if glosas_df is not None and not glosas_df.empty:
+            glosas_df.to_excel(writer, sheet_name="Glosas",    index=False)
+        if prazos_df is not None and not prazos_df.empty:
+            prazos_df.to_excel(writer, sheet_name="Prazos",    index=False)
+        if orfas_df is not None and not orfas_df.empty:
+            orfas_df.to_excel(writer,  sheet_name="Quitações órfãs", index=False)
+        envios_export.to_excel(writer,    sheet_name="Envios",    index=False)
+        quitacoes_export.to_excel(writer, sheet_name="Quitações", index=False)
+        _aplicar_formato_data_xlsx(writer, "Envios",    envios_export)
+        _aplicar_formato_data_xlsx(writer, "Quitações", quitacoes_export)
+    return buf.getvalue()
+
+
+def gerar_json_analise(envios_df, quitacoes_df, analise_df, meta):
+    """Gera JSON cru (bytes) com meta + dados crus + análise — útil pra migração futura."""
+    obj = {
+        "meta":      meta,
+        "envios":    envios_df.to_dict(orient="records"),
+        "quitacoes": quitacoes_df.to_dict(orient="records"),
+        "analise":   analise_df.to_dict(orient="records"),
+    }
+    return json.dumps(obj, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+
+
+def limpar_pasta_tmp(pasta):
+    """Remove arquivos e a pasta temporária da análise. Tolera erros."""
+    if not pasta or not os.path.isdir(pasta):
+        return
+    try:
+        for arq in glob.glob(os.path.join(pasta, "*")):
+            try: os.remove(arq)
+            except Exception: pass
+        os.rmdir(pasta)
+    except Exception:
+        pass
 
 
 # ─── BROWSER ──────────────────────────────────────────────────────
@@ -603,11 +1097,42 @@ def sessao_persistente_thread(usuario, senha, api_key, log_queue, cmd_queue):
                         dados = buscar_acompanhamento(page, data_ini, data_fim, credenciado, log_queue)
                         if not dados or len(dados) <= 1:
                             log_queue.put(("ERRO_OPERACAO",
-                                "Nenhum dado encontrado para esse credenciado e período. "
-                                "Verifique as datas e tente novamente."))
+                                "Nenhum envio encontrado para esse credenciado e período. "
+                                "Lembrete: o portal AMHP só tem dados de envios digitais a "
+                                f"partir de {DATA_MINIMA_ENVIOS_DIGITAIS.strftime('%d/%m/%Y')}."))
                         else:
                             nome_arq = salvar_acompanhamento_xlsx(dados, credenciado, data_ini, data_fim)
                             log_queue.put(("ACOMPANHAMENTO_OK", nome_arq, len(dados) - 1))
+
+                    elif acao == "RODAR_ANALISE":
+                        _, credenciado, data_ini, data_fim, refs_quitacao = cmd
+
+                        log_queue.put("Etapa 1/2: buscando envios digitais...")
+                        envios_raw = buscar_acompanhamento(page, data_ini, data_fim, credenciado, log_queue)
+                        if not envios_raw or len(envios_raw) <= 1:
+                            log_queue.put(("ERRO_OPERACAO",
+                                "Nenhum envio encontrado para esse credenciado e período. "
+                                "Lembrete: o portal AMHP só tem dados de envios digitais a "
+                                f"partir de {DATA_MINIMA_ENVIOS_DIGITAIS.strftime('%d/%m/%Y')}."))
+                        else:
+                            log_queue.put(f"Envios encontrados: {len(envios_raw) - 1} linha(s).")
+                            log_queue.put("Etapa 2/2: baixando quitações...")
+                            navegar_para_extrato(page, credenciado, log_queue)
+
+                            pasta_tmp = tempfile.mkdtemp(prefix="amhp_analise_")
+                            csv_paths = []
+                            total = len(refs_quitacao)
+                            for i, ref in enumerate(refs_quitacao):
+                                log_queue.put(f"  [{i+1}/{total}] Baixando {ref}...")
+                                try:
+                                    caminho = exportar_csv(page, ref, usuario, pasta_destino=pasta_tmp)
+                                    if caminho:
+                                        csv_paths.append(caminho)
+                                    time.sleep(0.5)
+                                except Exception as e:
+                                    log_queue.put(f"  Erro em {ref}: {e}")
+
+                            log_queue.put(("ANALISE_OK", envios_raw, csv_paths, pasta_tmp))
 
                     else:
                         log_queue.put(f"Comando desconhecido: {acao}")
@@ -686,6 +1211,24 @@ def resetar_sessao():
 # ─── INTERFACE STREAMLIT ──────────────────────────────────────────
 
 st.set_page_config(page_title="Exportar Extrato AMHP", page_icon="📊", layout="centered")
+
+# Tentativa de forçar locale PT-BR no calendário do date_input.
+# O Streamlit não oferece API nativa pra isso; injetamos JS no documento pai
+# pra que widgets que respeitam o atributo `lang` mostrem meses em portugues.
+components.html(
+    """
+    <script>
+    try {
+        const doc = window.parent && window.parent.document;
+        if (doc && doc.documentElement) {
+            doc.documentElement.lang = 'pt-BR';
+            doc.documentElement.setAttribute('lang', 'pt-BR');
+        }
+    } catch (e) { /* silencioso */ }
+    </script>
+    """,
+    height=0,
+)
 
 st.markdown("""
 <style>
@@ -868,6 +1411,121 @@ def botao_cancelar_operacao(key):
         st.rerun()
 
 
+def _formatar_brl(valor):
+    """Formata float como '1.234,56' (estilo brasileiro)."""
+    return f"{valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def _render_resultado_analise(nome_base, contexto_label=None, key_prefix="analise"):
+    """Renderiza a tela de resultado da análise (métricas, diagnóstico,
+    preview, tabelas auxiliares e botões de download). Usado tanto pela
+    análise online quanto pela manual."""
+    analise_df   = st.session_state.analise_resultado_df
+    envios_df    = st.session_state.analise_envios_df
+    quitacoes_df = st.session_state.analise_quitacoes_df
+    glosas_df    = st.session_state.get("analise_glosas_df")
+    prazos_df    = st.session_state.get("analise_prazos_df")
+    orfas_df     = st.session_state.get("analise_orfas_df")
+    diag         = st.session_state.get("analise_diag", {})
+    meta         = st.session_state.analise_meta
+
+    if not st.session_state.get("analise_celebrou"):
+        st.balloons()
+        st.session_state["analise_celebrou"] = True
+
+    total     = len(analise_df)
+    quitadas  = int((analise_df["Status"] == "Quitada integralmente").sum())
+    parciais  = int((analise_df["Status"] == "Quitada parcial (glosa)").sum())
+    pendentes = int((analise_df["Status"] == "Pendente").sum())
+    soma_env  = float(analise_df["Valor_Guia_Enviado"].sum())
+    soma_rec  = float(analise_df["Total_Repasse"].sum())
+    soma_dif  = float(analise_df["Diferenca"].sum())
+
+    st.success(f"✅ Análise concluída! {total} guia(s) processada(s).")
+    if contexto_label:
+        st.caption(contexto_label)
+
+    if diag.get("envios_duplicados"):
+        st.warning(
+            f"⚠️ {diag['envios_duplicados']} envio(s) tinham número de guia "
+            "repetido — os valores dessas guias foram somados na análise."
+        )
+
+    if orfas_df is not None and not orfas_df.empty:
+        soma_orfa = float(orfas_df["Total_Repasse"].sum())
+        st.warning(
+            f"⚠️ {len(orfas_df)} guia(s) da quitação não estão nos envios "
+            "(provavelmente são de envios anteriores) — total recebido: "
+            f"R$ {_formatar_brl(soma_orfa)}. Veja a aba 'Quitações órfãs' no XLSX."
+        )
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total",     total)
+    c2.metric("Quitadas",  quitadas)
+    c3.metric("Parciais",  parciais)
+    c4.metric("Pendentes", pendentes)
+
+    c5, c6, c7 = st.columns(3)
+    c5.metric("Enviado (R$)",   _formatar_brl(soma_env))
+    c6.metric("Recebido (R$)",  _formatar_brl(soma_rec))
+    c7.metric("Diferença (R$)", _formatar_brl(soma_dif))
+
+    with st.expander("🔎 Diagnóstico (colunas detectadas)"):
+        st.write({
+            "Valor da Guia (envios)":       diag.get("col_valor_envio")    or "❌ não detectada",
+            "Nº da Guia (envios)":          diag.get("col_guia_envio")     or "❌ não detectada",
+            "Nº da Guia (quitação)":        diag.get("col_guia_quitacao")  or "❌ não detectada",
+            "Valor do Repasse (quitação)":  diag.get("col_repasse")        or "❌ não detectada",
+            "Valor da Glosa (quitação)":    diag.get("col_glosa")          or "❌ não detectada",
+            "Código do Serviço (quitação)": diag.get("col_codigo")         or "❌ não detectada",
+            "Descrição do Serviço (quit.)": diag.get("col_descricao")      or "❌ não detectada",
+        })
+
+    st.markdown("---")
+    st.markdown("**Pré-visualização do resultado:**")
+    st.dataframe(analise_df, use_container_width=True, height=320)
+
+    if glosas_df is not None and not glosas_df.empty:
+        st.markdown(f"**Glosas detalhadas ({len(glosas_df)} procedimento(s) glosado(s)):**")
+        st.dataframe(glosas_df, use_container_width=True, height=240)
+
+    if prazos_df is not None and not prazos_df.empty:
+        st.markdown(f"**Prazos médios por convênio ({len(prazos_df)} convênio(s)):**")
+        st.dataframe(prazos_df, use_container_width=True, height=240)
+
+    if orfas_df is not None and not orfas_df.empty:
+        st.markdown(f"**Quitações órfãs ({len(orfas_df)} guia(s) sem envio correspondente):**")
+        st.dataframe(orfas_df, use_container_width=True, height=240)
+
+    st.markdown("---")
+    st.markdown("**Baixar resultados:**")
+    xlsx_bytes = gerar_xlsx_analise(
+        envios_df, quitacoes_df, analise_df, meta,
+        diag, glosas_df, prazos_df, orfas_df,
+    )
+    json_bytes = gerar_json_analise(envios_df, quitacoes_df, analise_df, meta)
+
+    col_x, col_j = st.columns(2)
+    with col_x:
+        st.download_button(
+            label="⬇️ Baixar XLSX",
+            data=xlsx_bytes,
+            file_name=f"{nome_base}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key=f"dl_{key_prefix}_xlsx",
+        )
+    with col_j:
+        st.download_button(
+            label="⬇️ Baixar JSON (dados crus)",
+            data=json_bytes,
+            file_name=f"{nome_base}.json",
+            mime="application/json",
+            use_container_width=True,
+            key=f"dl_{key_prefix}_json",
+        )
+
+
 # ──────────────────────────────────────────────────────────────────
 # TELA: Login (formulário)
 # ──────────────────────────────────────────────────────────────────
@@ -876,7 +1534,10 @@ if st.session_state.step == "input":
         st.error(st.session_state.pop("erro"))
 
     if not api_key:
-        st.error("Chave 2captcha não configurada. Defina a variável de ambiente ANTICAPTCHA_KEY.")
+        st.warning(
+            "Chave 2captcha não configurada — você não pode entrar no portal AMHP, "
+            "mas pode usar a **Análise manual** abaixo."
+        )
     else:
         config = carregar_config()
         usuario_default = config.get("ultimo_usuario", "")
@@ -912,6 +1573,13 @@ if st.session_state.step == "input":
                 st.session_state.step = "logando"
                 st.session_state.logs_acumulados = []
                 st.rerun()
+
+    st.markdown("---")
+    st.caption("Sem precisar entrar no portal:")
+    if st.button("📂 Análise manual (subir arquivos)", use_container_width=True,
+                 key="btn_analise_manual", type="secondary"):
+        st.session_state.step = "analise_manual_upload"
+        st.rerun()
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -1037,6 +1705,14 @@ elif st.session_state.step == "menu":
     if st.button("📋 Acompanhamento de Envios Digitais", use_container_width=True, key="btn_acomp", type="primary"):
         st.session_state.fluxo_atual = "acompanhamento"
         st.session_state.step = "acomp_filtros"
+        st.rerun()
+
+    if st.button("🔍 Análise: Envios vs Quitações", use_container_width=True, key="btn_analise", type="primary"):
+        st.session_state.fluxo_atual = "analise"
+        st.session_state.step = "analise_listando"
+        st.session_state.logs_acumulados = []
+        esvaziar_log_queue()
+        st.session_state.cmd_queue.put(("LISTAR_REFS_QUITACAO", st.session_state.credenciado_atual))
         st.rerun()
 
     st.markdown("---")
@@ -1305,13 +1981,26 @@ elif st.session_state.step == "acomp_filtros":
     banner_sessao_ativa()
     st.markdown("**Acompanhamento de Envios Digitais**")
     st.caption(f"Credenciado: {st.session_state.credenciado_atual}")
+    st.caption(
+        "ℹ️ O portal AMHP só tem dados de envios digitais a partir de "
+        f"{DATA_MINIMA_ENVIOS_DIGITAIS.strftime('%d/%m/%Y')}."
+    )
 
+    data_default_ini = max(DATA_MINIMA_ENVIOS_DIGITAIS, date.today())
     with st.form("acomp_filtros_form"):
         col_ini, col_fim = st.columns(2)
         with col_ini:
-            data_ini_dt = st.date_input("Data Início", format="DD/MM/YYYY", value=date.today())
+            data_ini_dt = st.date_input(
+                "Data Início", format="DD/MM/YYYY",
+                value=data_default_ini,
+                min_value=DATA_MINIMA_ENVIOS_DIGITAIS,
+            )
         with col_fim:
-            data_fim_dt = st.date_input("Data Fim", format="DD/MM/YYYY", value=date.today())
+            data_fim_dt = st.date_input(
+                "Data Fim", format="DD/MM/YYYY",
+                value=date.today(),
+                min_value=DATA_MINIMA_ENVIOS_DIGITAIS,
+            )
         buscar = st.form_submit_button("Buscar Atendimentos", use_container_width=True)
 
     if st.button("← Voltar ao menu", use_container_width=True, key="voltar_acomp_filtros", type="secondary"):
@@ -1406,7 +2095,7 @@ elif st.session_state.step == "acomp_done":
         st.balloons()
         st.session_state["acomp_celebrou"] = True
 
-    st.success(f"✅ Concluído! {total} linha(s) encontrada(s).")
+    st.success(f"✅ Concluído! {total} envio(s) encontrado(s).")
     st.caption(f"📁 Salvo também em: `{PASTA_DESTINO}`")
     if nome_arq and os.path.exists(nome_arq):
         with open(nome_arq, "rb") as f:
@@ -1425,6 +2114,385 @@ elif st.session_state.step == "acomp_done":
         st.session_state.pop("acomp_celebrou", None)
         st.session_state.step          = "menu"
         st.rerun()
+
+
+# ──────────────────────────────────────────────────────────────────
+# TELA: Análise — buscando referências
+# ──────────────────────────────────────────────────────────────────
+elif st.session_state.step == "analise_listando":
+    banner_sessao_ativa()
+    log_queue = st.session_state.log_queue
+    thread    = st.session_state.browser_thread
+    ESTIMATIVA = 20
+
+    st.markdown("**Análise: Envios vs Quitações**")
+    st.caption("Buscando referências de quitação disponíveis...")
+    progress_bar = st.progress(0.0)
+    col_t, col_m = st.columns([1, 3])
+    timer_ph     = col_t.empty()
+    msg_ph       = col_m.empty()
+    status_ph    = st.empty()
+    botao_cancelar_operacao(key="cancel_analise_list")
+
+    start_time = time.time()
+    eventos    = []
+    logs       = st.session_state.logs_acumulados
+
+    refs, erro = None, None
+    while refs is None and erro is None:
+        elapsed = time.time() - start_time
+        progress_bar.progress(min(elapsed / ESTIMATIVA, 0.95))
+        timer_ph.metric("⏱", f"{int(elapsed)}s")
+        if elapsed < ESTIMATIVA:
+            msg_ph.caption(f"Tempo estimado: ~{ESTIMATIVA}s")
+        else:
+            msg_ph.caption("⚠️ Tá demorando mais que o normal...")
+
+        drenar_log_queue(log_queue, eventos, logs)
+        for ev in eventos:
+            if ev[0] == "REFERENCIAS":
+                refs = ev[1]
+            elif ev[0] in ("ERRO_OPERACAO", "ERRO_LOGIN"):
+                erro = ev[1]
+        eventos.clear()
+
+        if logs:
+            status_ph.info(logs[-1])
+
+        if refs is None and erro is None:
+            if not thread.is_alive():
+                erro = "A sessão encerrou inesperadamente."
+                break
+            time.sleep(0.2)
+
+    progress_bar.progress(1.0)
+
+    if erro:
+        st.session_state.erro = erro
+        st.session_state.step = "menu"
+    else:
+        st.session_state.analise_refs = refs
+        st.session_state.step = "analise_filtros"
+    st.rerun()
+
+
+# ──────────────────────────────────────────────────────────────────
+# TELA: Análise — filtros
+# ──────────────────────────────────────────────────────────────────
+elif st.session_state.step == "analise_filtros":
+    banner_sessao_ativa()
+    st.markdown("**Análise: Envios vs Quitações**")
+    st.caption(f"Credenciado: {st.session_state.credenciado_atual}")
+    st.info(
+        "Escolha o período dos envios digitais que você quer analisar e quais "
+        "referências de quitação cruzar. O resultado mostra, guia por guia, "
+        "o que já foi quitado, o que veio com glosa e o que ainda está pendente."
+    )
+    st.caption(
+        "ℹ️ O portal AMHP só tem dados de envios digitais a partir de "
+        f"{DATA_MINIMA_ENVIOS_DIGITAIS.strftime('%d/%m/%Y')}."
+    )
+
+    refs_disponiveis = st.session_state.get("analise_refs", [])
+    default_refs = refs_disponiveis[:2] if len(refs_disponiveis) >= 2 else refs_disponiveis
+    data_default_ini = max(DATA_MINIMA_ENVIOS_DIGITAIS, date.today())
+
+    with st.form("analise_filtros_form"):
+        col_ini, col_fim = st.columns(2)
+        with col_ini:
+            data_ini_dt = st.date_input(
+                "Data Início (envio)", format="DD/MM/YYYY",
+                value=data_default_ini,
+                min_value=DATA_MINIMA_ENVIOS_DIGITAIS,
+            )
+        with col_fim:
+            data_fim_dt = st.date_input(
+                "Data Fim (envio)", format="DD/MM/YYYY",
+                value=date.today(),
+                min_value=DATA_MINIMA_ENVIOS_DIGITAIS,
+            )
+
+        refs_escolhidas = st.multiselect(
+            "Referências de quitação a cruzar",
+            options=refs_disponiveis,
+            default=default_refs,
+            help="Inclua as referências que cobrem o período que você espera ter recebido. "
+                 "Recomendado: o mês do envio e os 1–2 seguintes.",
+        )
+
+        rodar = st.form_submit_button("Rodar análise", use_container_width=True, type="primary")
+
+    if st.button("← Voltar ao menu", use_container_width=True, key="voltar_analise_filtros", type="secondary"):
+        st.session_state.step = "menu"
+        st.rerun()
+
+    if rodar:
+        if data_ini_dt > data_fim_dt:
+            st.error("A Data Início não pode ser depois da Data Fim.")
+        elif not refs_escolhidas:
+            st.error("Selecione pelo menos uma referência de quitação.")
+        else:
+            data_ini = data_ini_dt.strftime("%d/%m/%Y")
+            data_fim = data_fim_dt.strftime("%d/%m/%Y")
+            st.session_state.analise_meta = {
+                "credenciado":    st.session_state.credenciado_atual,
+                "data_ini":       data_ini,
+                "data_fim":       data_fim,
+                "refs_quitacao":  refs_escolhidas,
+                "gerado_em":      datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+            }
+            st.session_state.logs_acumulados = []
+            esvaziar_log_queue()
+            st.session_state.cmd_queue.put((
+                "RODAR_ANALISE",
+                st.session_state.credenciado_atual,
+                data_ini, data_fim,
+                refs_escolhidas,
+            ))
+            st.session_state.step = "analise_processando"
+            st.rerun()
+
+
+# ──────────────────────────────────────────────────────────────────
+# TELA: Análise — processando
+# ──────────────────────────────────────────────────────────────────
+elif st.session_state.step == "analise_processando":
+    banner_sessao_ativa()
+    log_queue = st.session_state.log_queue
+    thread    = st.session_state.browser_thread
+    meta      = st.session_state.get("analise_meta", {})
+    qtd_refs  = len(meta.get("refs_quitacao", []))
+    ESTIMATIVA = 30 + 60 * qtd_refs  # envio + ~60s por referência
+
+    st.markdown("**Rodando análise...**")
+    st.caption(f"Período: {meta.get('data_ini')} a {meta.get('data_fim')} · "
+               f"{qtd_refs} referência(s) de quitação")
+    progress_bar = st.progress(0.0)
+    col_t, col_m = st.columns([1, 3])
+    timer_ph     = col_t.empty()
+    msg_ph       = col_m.empty()
+    log_ph       = st.empty()
+    botao_cancelar_operacao(key="cancel_analise_proc")
+
+    start_time = time.time()
+    eventos    = []
+    logs       = st.session_state.logs_acumulados
+    resultado, erro = None, None
+
+    while resultado is None and erro is None:
+        elapsed = time.time() - start_time
+        progress_bar.progress(min(elapsed / ESTIMATIVA, 0.95))
+        timer_ph.metric("⏱", f"{int(elapsed)}s")
+        if elapsed < ESTIMATIVA:
+            msg_ph.caption(f"Tempo estimado: ~{ESTIMATIVA}s")
+        else:
+            msg_ph.caption("⚠️ Tá demorando mais que o normal...")
+
+        drenar_log_queue(log_queue, eventos, logs)
+        for ev in eventos:
+            if ev[0] == "ANALISE_OK":
+                resultado = ev
+            elif ev[0] in ("ERRO_OPERACAO", "ERRO_LOGIN"):
+                erro = ev[1]
+        eventos.clear()
+
+        if logs:
+            log_ph.info(logs[-1])
+
+        if resultado is None and erro is None:
+            if not thread.is_alive():
+                erro = "A sessão encerrou inesperadamente."
+                break
+            time.sleep(0.3)
+
+    progress_bar.progress(1.0)
+
+    if erro:
+        st.session_state.erro = erro
+        st.session_state.step = "menu"
+        st.rerun()
+    else:
+        _, envios_raw, csv_paths, pasta_tmp = resultado
+        try:
+            envios_df          = envios_para_df(envios_raw)
+            quitacoes_df       = quitacoes_para_df(csv_paths)
+            analise_df, diag   = cruzar_envios_quitacoes(envios_df, quitacoes_df)
+            glosas_df          = tabela_glosas(quitacoes_df, diag)
+            prazos_df          = tabela_prazos_por_convenio(quitacoes_df, diag)
+            orfas_df           = tabela_orfas(quitacoes_df, envios_df, diag)
+
+            st.session_state.analise_envios_df    = envios_df
+            st.session_state.analise_quitacoes_df = quitacoes_df
+            st.session_state.analise_resultado_df = analise_df
+            st.session_state.analise_diag         = diag
+            st.session_state.analise_glosas_df    = glosas_df
+            st.session_state.analise_prazos_df    = prazos_df
+            st.session_state.analise_orfas_df     = orfas_df
+            st.session_state.analise_pasta_tmp    = pasta_tmp
+            st.session_state.step = "analise_done"
+        except Exception as e:
+            limpar_pasta_tmp(pasta_tmp)
+            st.session_state.erro = f"Erro ao cruzar os dados: {e}"
+            st.session_state.step = "menu"
+        st.rerun()
+
+
+# ──────────────────────────────────────────────────────────────────
+# TELA: Análise — resultado + downloads
+# ──────────────────────────────────────────────────────────────────
+elif st.session_state.step == "analise_done":
+    banner_sessao_ativa()
+    meta = st.session_state.analise_meta
+    cred_slug = (meta.get("credenciado", "")[:6] or "cred").strip().replace(" ", "_")
+    stamp     = datetime.now().strftime("%Y%m%d_%H%M")
+    _render_resultado_analise(
+        nome_base=f"Analise_{cred_slug}_{stamp}",
+        key_prefix="analise_online",
+    )
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    if st.button("← Voltar ao menu", use_container_width=True,
+                 key="voltar_analise_done", type="primary"):
+        limpar_pasta_tmp(st.session_state.get("analise_pasta_tmp"))
+        for chave in [
+            "analise_envios_df", "analise_quitacoes_df", "analise_resultado_df",
+            "analise_glosas_df", "analise_prazos_df", "analise_orfas_df", "analise_diag",
+            "analise_meta", "analise_pasta_tmp", "analise_refs", "analise_celebrou",
+        ]:
+            st.session_state.pop(chave, None)
+        st.session_state.step = "menu"
+        st.rerun()
+
+
+# ──────────────────────────────────────────────────────────────────
+# TELA: Análise manual — upload
+# ──────────────────────────────────────────────────────────────────
+elif st.session_state.step == "analise_manual_upload":
+    st.markdown("**Análise Manual: Envios vs Quitações**")
+    st.info(
+        "Faça upload do arquivo de envios e dos arquivos de quitação. "
+        "O cruzamento é feito localmente, **sem precisar acessar o portal AMHP**. "
+        "Aceita XLSX, XLS e CSV."
+    )
+
+    envios_file = st.file_uploader(
+        "Arquivo de Envios (Acompanhamento)",
+        type=["xlsx", "xls", "csv"],
+        accept_multiple_files=False,
+        key="manual_envios",
+    )
+
+    quitacoes_files = st.file_uploader(
+        "Arquivos de Quitação (Extrato) — pode subir vários",
+        type=["xlsx", "xls", "csv"],
+        accept_multiple_files=True,
+        key="manual_quitacoes",
+    )
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if st.button("← Voltar", use_container_width=True,
+                     key="voltar_manual_upload", type="secondary"):
+            st.session_state.step = "input"
+            st.rerun()
+    with col_b:
+        rodar = st.button("Rodar análise", use_container_width=True,
+                          type="primary", key="rodar_manual")
+
+    if rodar:
+        if not envios_file:
+            st.error("Suba o arquivo de envios.")
+        elif not quitacoes_files:
+            st.error("Suba pelo menos um arquivo de quitação.")
+        else:
+            progresso = st.empty()
+            try:
+                progresso.info(f"📄 Lendo envios ({envios_file.name})...")
+                envios_df = ler_arquivo_para_df(envios_file)
+                progresso.info(
+                    f"✅ Envios: {len(envios_df)} linha(s), "
+                    f"{len(envios_df.columns)} coluna(s). Lendo quitações..."
+                )
+
+                frames = []
+                for i, f in enumerate(quitacoes_files, start=1):
+                    progresso.info(f"📄 Lendo quitação [{i}/{len(quitacoes_files)}]: {f.name}...")
+                    df = ler_arquivo_para_df(f)
+                    df["__Referencia"] = f.name.rsplit(".", 1)[0]
+                    frames.append(df)
+                quitacoes_df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+                progresso.info(
+                    f"✅ Quitações: {len(quitacoes_df)} linha(s) no total. "
+                    "Cruzando dados..."
+                )
+
+                analise_df, diag = cruzar_envios_quitacoes(envios_df, quitacoes_df)
+                progresso.info("✅ Cruzamento feito. Montando tabelas auxiliares...")
+
+                glosas_df = tabela_glosas(quitacoes_df, diag)
+                prazos_df = tabela_prazos_por_convenio(quitacoes_df, diag)
+                orfas_df  = tabela_orfas(quitacoes_df, envios_df, diag)
+
+                st.session_state.analise_envios_df    = envios_df
+                st.session_state.analise_quitacoes_df = quitacoes_df
+                st.session_state.analise_resultado_df = analise_df
+                st.session_state.analise_diag         = diag
+                st.session_state.analise_glosas_df    = glosas_df
+                st.session_state.analise_prazos_df    = prazos_df
+                st.session_state.analise_orfas_df     = orfas_df
+                st.session_state.analise_meta = {
+                    "credenciado":   "(análise manual)",
+                    "data_ini":      "",
+                    "data_fim":      "",
+                    "refs_quitacao": [f.name for f in quitacoes_files],
+                    "gerado_em":     datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+                }
+                progresso.success("✅ Pronto! Carregando tela de resultado...")
+                st.session_state.step = "analise_manual_done"
+                st.rerun()
+            except Exception as e:
+                import traceback
+                progresso.empty()
+                st.error(f"Erro ao processar arquivos: {e}")
+                st.code(traceback.format_exc(), language="text")
+
+
+# ──────────────────────────────────────────────────────────────────
+# TELA: Análise manual — resultado + downloads
+# ──────────────────────────────────────────────────────────────────
+elif st.session_state.step == "analise_manual_done":
+    stamp = datetime.now().strftime("%Y%m%d_%H%M")
+    _render_resultado_analise(
+        nome_base=f"Analise_Manual_{stamp}",
+        contexto_label="Modo manual — arquivos enviados por upload.",
+        key_prefix="analise_manual",
+    )
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    col_n, col_v = st.columns(2)
+    with col_n:
+        if st.button("↺ Nova análise manual", use_container_width=True,
+                     key="nova_manual", type="primary"):
+            for chave in [
+                "analise_envios_df", "analise_quitacoes_df", "analise_resultado_df",
+                "analise_glosas_df", "analise_prazos_df", "analise_orfas_df",
+                "analise_diag", "analise_meta", "analise_celebrou",
+                "manual_envios", "manual_quitacoes",
+            ]:
+                st.session_state.pop(chave, None)
+            st.session_state.step = "analise_manual_upload"
+            st.rerun()
+    with col_v:
+        if st.button("← Tela inicial", use_container_width=True,
+                     key="voltar_manual_done", type="secondary"):
+            for chave in [
+                "analise_envios_df", "analise_quitacoes_df", "analise_resultado_df",
+                "analise_glosas_df", "analise_prazos_df", "analise_orfas_df",
+                "analise_diag", "analise_meta", "analise_celebrou",
+            ]:
+                st.session_state.pop(chave, None)
+            st.session_state.step = "input"
+            st.rerun()
 
 
 # ──────────────────────────────────────────────────────────────────
