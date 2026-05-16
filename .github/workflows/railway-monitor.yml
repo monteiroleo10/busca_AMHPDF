@@ -1,0 +1,40 @@
+name: Monitor Railway Deploy
+
+on:
+  push:
+    branches: [main]  # troca se sua branch principal for outra
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verifica status do deploy no Railway
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          SERVICE_ID: ${{ secrets.RAILWAY_SERVICE_ID }}
+        run: |
+          echo "🚀 Deploy iniciado — commit ${{ github.sha }}"
+          sleep 15
+
+          for i in {1..12}; do
+            STATUS=$(curl -s -X POST https://backboard.railway.app/graphql/v2 \
+              -H "Authorization: Bearer $RAILWAY_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "{\"query\": \"{ deployments(input: { serviceId: \\\"$SERVICE_ID\\\" }) { edges { node { status createdAt } } } }\"}" \
+              | jq -r '.data.deployments.edges[0].node.status')
+
+            echo "[$i/12] Status: $STATUS"
+
+            if [ "$STATUS" = "SUCCESS" ]; then
+              echo "✅ Deploy concluído!"
+              exit 0
+            elif [ "$STATUS" = "FAILED" ] || [ "$STATUS" = "CRASHED" ]; then
+              echo "❌ Deploy falhou: $STATUS"
+              exit 1
+            fi
+
+            sleep 15
+          done
+
+          echo "⏱️ Timeout após 3 minutos"
+          exit 1
