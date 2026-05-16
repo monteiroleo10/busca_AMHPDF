@@ -259,8 +259,7 @@ def obter_credenciados_disponiveis(page, log_queue):
     except Exception:
         pass
 
-    page.goto(URL_ACOMPANHAMENTO)
-    page.wait_for_load_state("domcontentloaded")
+    page.goto(URL_ACOMPANHAMENTO, wait_until="domcontentloaded", timeout=120000)
     page.wait_for_selector("#ctl00_MainContent_rcbCredenciado_Input", timeout=30000)
     page.locator("#ctl00_MainContent_rcbCredenciado_Input").click()
     page.wait_for_selector(
@@ -301,9 +300,9 @@ def selecionar_credenciado_no_dropdown(page, credenciado, prefixo_id):
 
 def navegar_para_extrato(page, credenciado, log_queue):
     """Vai para a página de Extrato e seleciona o credenciado."""
-    page.goto(URL_EXTRATO)
-    # DOM pronto basta — temos waits específicos abaixo.
-    page.wait_for_load_state("domcontentloaded")
+    # Timeout generoso: depois de uma busca grande, o portal AMHP pode
+    # demorar mais que os 30s padrao do Playwright para carregar a página.
+    page.goto(URL_EXTRATO, wait_until="domcontentloaded", timeout=120000)
 
     try:
         page.wait_for_selector("#ctl00_MainContent_rcbCredenciado_Input", timeout=5000)
@@ -417,7 +416,7 @@ def consolidar_excel(arquivos, usuario):
 
 def buscar_acompanhamento(page, data_ini, data_fim, credenciado, log_queue):
     log_queue.put("Navegando para a página de envios digitais...")
-    page.goto(URL_ACOMPANHAMENTO)
+    page.goto(URL_ACOMPANHAMENTO, wait_until="domcontentloaded", timeout=120000)
     page.wait_for_selector("#ctl00_MainContent_rdpDataInicio_dateInput", timeout=20000)
 
     log_queue.put("Preenchendo filtros...")
