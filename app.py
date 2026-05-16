@@ -478,16 +478,30 @@ def buscar_acompanhamento(page, data_ini, data_fim, credenciado, log_queue):
 
     log_queue.put("Extraindo dados da tabela...")
     # Extracao em UMA chamada ao navegador (em vez de uma por celula).
-    # Acelera dramaticamente quando a tabela tem muitas linhas.
+    # Ignora linhas de "Nenhum registro" do Telerik e linhas-mensagem
+    # (1 célula com colSpan grande), que antes eram contadas como dado válido.
     dados = page.evaluate("""() => {
-        const rows = Array.from(document.querySelectorAll(
-            '#ctl00_MainContent_rdgAcompanhamentoDigital table.rgMasterTable tr'
-        ));
-        return rows.map(row =>
-            Array.from(row.querySelectorAll('th, td'))
-                 .map(c => (c.innerText || '').trim())
-        ).filter(row => row.some(cell => cell.length > 0));
+        const grid = document.querySelector('#ctl00_MainContent_rdgAcompanhamentoDigital');
+        if (!grid) return [];
+        const tabela = grid.querySelector('table.rgMasterTable');
+        if (!tabela) return [];
+        const linhas = Array.from(tabela.querySelectorAll('tr'));
+        const out = [];
+        for (const tr of linhas) {
+            if (tr.classList && (
+                tr.classList.contains('rgNoRecords') ||
+                tr.classList.contains('rgEmptyData')
+            )) continue;
+            const celulas = Array.from(tr.querySelectorAll('th, td'));
+            if (celulas.length === 0) continue;
+            // Linha-mensagem (1 célula esticada por colSpan) — não é dado.
+            if (celulas.length === 1 && celulas[0].colSpan && celulas[0].colSpan > 1) continue;
+            const row = celulas.map(c => (c.innerText || '').trim());
+            if (row.some(c => c.length > 0)) out.push(row);
+        }
+        return out;
     }""")
+    log_queue.put(f"Tabela retornou {len(dados)} linha(s) (incluindo cabeçalho).")
     return dados or []
 
 
