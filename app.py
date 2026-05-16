@@ -487,11 +487,14 @@ def salvar_acompanhamento_xlsx(dados, credenciado, data_ini, data_fim):
 # ─── ANÁLISE: ENVIOS vs QUITAÇÕES ─────────────────────────────────
 
 def _encontrar_coluna(df, candidatos):
-    """Procura coluna por substring (case-insensitive). Retorna nome ou None."""
-    for col in df.columns:
-        col_norm = str(col).strip().lower()
-        for cand in candidatos:
-            if cand.lower() in col_norm:
+    """Procura coluna por substring (case-insensitive), respeitando ordem de
+    prioridade dos candidatos: tenta o 1º candidato em todas as colunas, depois
+    o 2º, etc. Retorna nome da coluna ou None."""
+    cols_norm = [(c, str(c).strip().lower()) for c in df.columns]
+    for cand in candidatos:
+        cand_norm = cand.lower()
+        for col, col_norm in cols_norm:
+            if cand_norm in col_norm:
                 return col
     return None
 
@@ -537,12 +540,16 @@ def quitacoes_para_df(csv_paths):
 def cruzar_envios_quitacoes(envios_df, quitacoes_df):
     """
     Cruza por número da guia. Retorna DataFrame com Numero_Guia,
-    Valor_Guia_Enviado, Total_Repasse, Diferenca, Qtd_Procedimentos, Status.
+    Valor_Guia_Enviado, Total_Repasse, Diferenca, Qtd_Procedimentos,
+    Status e Detalhe_Glosas.
     """
-    col_guia_env  = _encontrar_coluna(envios_df,    ["guia"])
-    col_valor_env = _encontrar_coluna(envios_df,    ["valor da guia", "vl total", "valor total", "valor"])
-    col_guia_qit  = _encontrar_coluna(quitacoes_df, ["guia"])
-    col_repasse   = _encontrar_coluna(quitacoes_df, ["repasse"])
+    col_guia_env  = _encontrar_coluna(envios_df,    ["nº guia", "n guia", "num guia", "numero da guia", "guia"])
+    col_valor_env = _encontrar_coluna(envios_df,    ["valor da guia", "vlr guia", "vl guia", "valor total", "vlr total"])
+    col_guia_qit  = _encontrar_coluna(quitacoes_df, ["nº guia", "n guia", "num guia", "numero da guia", "guia"])
+    col_repasse   = _encontrar_coluna(quitacoes_df, ["valor do repasse", "vlr repasse", "vl repasse", "repasse"])
+    col_glosa     = _encontrar_coluna(quitacoes_df, ["valor da glosa", "vlr glosa", "vl glosa", "valor glosa", "glosa"])
+    col_codigo    = _encontrar_coluna(quitacoes_df, ["código do serviço", "codigo do servico", "código", "codigo", "procedimento"])
+    col_desc      = _encontrar_coluna(quitacoes_df, ["descrição do serviço", "descricao do servico", "descrição", "descricao"])
 
     if not col_guia_env:
         raise ValueError("Não consegui identificar a coluna de número da guia nos envios.")
@@ -556,11 +563,27 @@ def cruzar_envios_quitacoes(envios_df, quitacoes_df):
 
     envios_df["__valor_guia"] = envios_df[col_valor_env].apply(_para_numero) if col_valor_env else 0.0
     quitacoes_df["__repasse"] = quitacoes_df[col_repasse].apply(_para_numero) if col_repasse else 0.0
+    quitacoes_df["__glosa"]   = quitacoes_df[col_glosa].apply(_para_numero)   if col_glosa   else 0.0
 
     agg = quitacoes_df.groupby("__guia").agg(
         Total_Repasse=("__repasse", "sum"),
+        Total_Glosa=("__glosa", "sum"),
         Qtd_Procedimentos=("__guia", "size"),
     ).reset_index()
+
+    # Detalhe das glosas: só os procedimentos com glosa > 0
+    detalhes_glosas = {}
+    com_glosa = quitacoes_df[quitacoes_df["__glosa"] > 0.001]
+    for guia, grupo in com_glosa.groupby("__guia"):
+        partes = []
+        for _, r in grupo.iterrows():
+            codigo = str(r[col_codigo]).strip() if col_codigo else ""
+            desc   = str(r[col_desc]).strip()   if col_desc   else ""
+            etiqueta = " ".join(p for p in [codigo, desc] if p)
+            valor = r["__glosa"]
+            valor_fmt = f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+            partes.append(f"{etiqueta}: {valor_fmt}" if etiqueta else valor_fmt)
+        detalhes_glosas[guia] = " | ".join(partes)
 
     resultado = envios_df[["__guia", "__valor_guia"]].rename(
         columns={"__guia": "Numero_Guia", "__valor_guia": "Valor_Guia_Enviado"}
@@ -570,8 +593,10 @@ def cruzar_envios_quitacoes(envios_df, quitacoes_df):
     )
 
     resultado["Total_Repasse"]     = resultado["Total_Repasse"].fillna(0.0)
+    resultado["Total_Glosa"]       = resultado["Total_Glosa"].fillna(0.0)
     resultado["Qtd_Procedimentos"] = resultado["Qtd_Procedimentos"].fillna(0).astype(int)
     resultado["Diferenca"]         = resultado["Valor_Guia_Enviado"] - resultado["Total_Repasse"]
+    resultado["Detalhe_Glosas"]    = resultado["Numero_Guia"].map(detalhes_glosas).fillna("")
 
     def _classificar(row):
         if row["Qtd_Procedimentos"] == 0:
@@ -581,6 +606,12 @@ def cruzar_envios_quitacoes(envios_df, quitacoes_df):
         return "Quitada parcial (glosa)"
 
     resultado["Status"] = resultado.apply(_classificar, axis=1)
+
+    # Reordenar colunas pra ficar mais legivel no Excel
+    resultado = resultado[[
+        "Numero_Guia", "Status", "Valor_Guia_Enviado", "Total_Repasse",
+        "Diferenca", "Total_Glosa", "Qtd_Procedimentos", "Detalhe_Glosas",
+    ]]
     return resultado
 
 
