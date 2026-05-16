@@ -41,6 +41,11 @@ URL_PERFIL          = "https://portal.amhp.com.br/pages/PJ/perfil.html"
 URL_EXTRATO         = "https://amhptiss.amhp.com.br/Extrato.aspx"
 URL_ACOMPANHAMENTO  = "https://amhptiss.amhp.com.br/AcompanhamentoAtendimentoDigital.aspx"
 
+# Portal AMHP só tem dados de envios digitais a partir desta data.
+# Datas anteriores retornam vazio mesmo quando a guia foi enviada
+# (via outro meio que não o digital).
+DATA_MINIMA_ENVIOS_DIGITAIS = date(2025, 6, 5)
+
 CONFIG_FILE = os.path.join(
     os.path.expanduser("~"), ".amhp_app_config.json"
 )
@@ -1054,8 +1059,9 @@ def sessao_persistente_thread(usuario, senha, api_key, log_queue, cmd_queue):
                         dados = buscar_acompanhamento(page, data_ini, data_fim, credenciado, log_queue)
                         if not dados or len(dados) <= 1:
                             log_queue.put(("ERRO_OPERACAO",
-                                "Nenhum dado encontrado para esse credenciado e período. "
-                                "Verifique as datas e tente novamente."))
+                                "Nenhum envio encontrado para esse credenciado e período. "
+                                "Lembrete: o portal AMHP só tem dados de envios digitais a "
+                                f"partir de {DATA_MINIMA_ENVIOS_DIGITAIS.strftime('%d/%m/%Y')}."))
                         else:
                             nome_arq = salvar_acompanhamento_xlsx(dados, credenciado, data_ini, data_fim)
                             log_queue.put(("ACOMPANHAMENTO_OK", nome_arq, len(dados) - 1))
@@ -1068,7 +1074,8 @@ def sessao_persistente_thread(usuario, senha, api_key, log_queue, cmd_queue):
                         if not envios_raw or len(envios_raw) <= 1:
                             log_queue.put(("ERRO_OPERACAO",
                                 "Nenhum envio encontrado para esse credenciado e período. "
-                                "Verifique as datas e tente novamente."))
+                                "Lembrete: o portal AMHP só tem dados de envios digitais a "
+                                f"partir de {DATA_MINIMA_ENVIOS_DIGITAIS.strftime('%d/%m/%Y')}."))
                         else:
                             log_queue.put(f"Envios encontrados: {len(envios_raw) - 1} linha(s).")
                             log_queue.put("Etapa 2/2: baixando quitações...")
@@ -1811,13 +1818,26 @@ elif st.session_state.step == "acomp_filtros":
     banner_sessao_ativa()
     st.markdown("**Acompanhamento de Envios Digitais**")
     st.caption(f"Credenciado: {st.session_state.credenciado_atual}")
+    st.caption(
+        "ℹ️ O portal AMHP só tem dados de envios digitais a partir de "
+        f"{DATA_MINIMA_ENVIOS_DIGITAIS.strftime('%d/%m/%Y')}."
+    )
 
+    data_default_ini = max(DATA_MINIMA_ENVIOS_DIGITAIS, date.today())
     with st.form("acomp_filtros_form"):
         col_ini, col_fim = st.columns(2)
         with col_ini:
-            data_ini_dt = st.date_input("Data Início", format="DD/MM/YYYY", value=date.today())
+            data_ini_dt = st.date_input(
+                "Data Início", format="DD/MM/YYYY",
+                value=data_default_ini,
+                min_value=DATA_MINIMA_ENVIOS_DIGITAIS,
+            )
         with col_fim:
-            data_fim_dt = st.date_input("Data Fim", format="DD/MM/YYYY", value=date.today())
+            data_fim_dt = st.date_input(
+                "Data Fim", format="DD/MM/YYYY",
+                value=date.today(),
+                min_value=DATA_MINIMA_ENVIOS_DIGITAIS,
+            )
         buscar = st.form_submit_button("Buscar Atendimentos", use_container_width=True)
 
     if st.button("← Voltar ao menu", use_container_width=True, key="voltar_acomp_filtros", type="secondary"):
@@ -2005,16 +2025,29 @@ elif st.session_state.step == "analise_filtros":
         "referências de quitação cruzar. O resultado mostra, guia por guia, "
         "o que já foi quitado, o que veio com glosa e o que ainda está pendente."
     )
+    st.caption(
+        "ℹ️ O portal AMHP só tem dados de envios digitais a partir de "
+        f"{DATA_MINIMA_ENVIOS_DIGITAIS.strftime('%d/%m/%Y')}."
+    )
 
     refs_disponiveis = st.session_state.get("analise_refs", [])
     default_refs = refs_disponiveis[:2] if len(refs_disponiveis) >= 2 else refs_disponiveis
+    data_default_ini = max(DATA_MINIMA_ENVIOS_DIGITAIS, date.today())
 
     with st.form("analise_filtros_form"):
         col_ini, col_fim = st.columns(2)
         with col_ini:
-            data_ini_dt = st.date_input("Data Início (envio)", format="DD/MM/YYYY", value=date.today())
+            data_ini_dt = st.date_input(
+                "Data Início (envio)", format="DD/MM/YYYY",
+                value=data_default_ini,
+                min_value=DATA_MINIMA_ENVIOS_DIGITAIS,
+            )
         with col_fim:
-            data_fim_dt = st.date_input("Data Fim (envio)",    format="DD/MM/YYYY", value=date.today())
+            data_fim_dt = st.date_input(
+                "Data Fim (envio)", format="DD/MM/YYYY",
+                value=date.today(),
+                min_value=DATA_MINIMA_ENVIOS_DIGITAIS,
+            )
 
         refs_escolhidas = st.multiselect(
             "Referências de quitação a cruzar",
