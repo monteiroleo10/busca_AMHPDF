@@ -514,6 +514,40 @@ def _para_data(valor):
         return pd.NaT
 
 
+def _aplicar_formato_data_xlsx(writer, sheet_name, df):
+    """Em colunas datetime do DF, aplica número_format DD/MM/YYYY na worksheet."""
+    ws = writer.sheets.get(sheet_name)
+    if ws is None:
+        return
+    from openpyxl.utils import get_column_letter
+    for col_idx, col_name in enumerate(df.columns, start=1):
+        if pd.api.types.is_datetime64_any_dtype(df[col_name]):
+            letter = get_column_letter(col_idx)
+            for row in range(2, len(df) + 2):
+                ws[f"{letter}{row}"].number_format = "DD/MM/YYYY"
+
+
+def _converter_colunas_data(df, limiar_taxa_sucesso=0.5):
+    """Detecta heuristicamente colunas que parecem datas (pelo nome) e as
+    converte para datetime. Só efetiva a conversão se pelo menos
+    `limiar_taxa_sucesso` das células viraram data válida (evita transformar
+    "Carater de Atendimento" em data quando o nome bate por coincidência)."""
+    if df is None or df.empty:
+        return df
+    candidatos = ["data", "atendimento", "entrega", "repasse ao", "realização", "realizacao"]
+    df = df.copy()
+    for col in df.columns:
+        col_norm = str(col).strip().lower()
+        if not any(c in col_norm for c in candidatos):
+            continue
+        convertido = df[col].apply(_para_data)
+        sucesso = convertido.notna().sum()
+        total   = len(df)
+        if total > 0 and sucesso >= limiar_taxa_sucesso * total:
+            df[col] = convertido
+    return df
+
+
 def _para_numero(valor):
     """Converte string monetária brasileira em float; retorna 0.0 se inválido."""
     if pd.isna(valor) or valor in (None, ""):
@@ -715,6 +749,47 @@ def tabela_prazos_por_convenio(quitacoes_df, diag):
     return agg
 
 
+def tabela_orfas(quitacoes_df, envios_df, diag):
+    """Retorna DataFrame com guias que aparecem nas quitações mas não estão
+    nos envios do período filtrado (foram enviadas antes). Uma linha por guia,
+    agregando repasse e glosa dos procedimentos. Retorna DF vazio se não houver."""
+    col_guia_qit  = diag.get("col_guia_quitacao")
+    col_guia_env  = diag.get("col_guia_envio")
+    col_repasse   = diag.get("col_repasse")
+    col_glosa     = diag.get("col_glosa")
+    col_convenio  = diag.get("col_convenio")
+
+    if not col_guia_qit or not col_guia_env:
+        return pd.DataFrame()
+
+    guias_envio = set(envios_df[col_guia_env].astype(str).str.strip().unique())
+
+    df = quitacoes_df.copy()
+    df["__guia"]    = df[col_guia_qit].astype(str).str.strip()
+    df["__repasse"] = df[col_repasse].apply(_para_numero) if col_repasse else 0.0
+    df["__glosa"]   = df[col_glosa].apply(_para_numero)   if col_glosa   else 0.0
+    df["__convenio"] = df[col_convenio].astype(str).str.strip() if col_convenio else ""
+
+    orfas = df[~df["__guia"].isin(guias_envio)]
+    if orfas.empty:
+        return pd.DataFrame(columns=[
+            "Numero_Guia", "Nome_Convenio", "Total_Repasse",
+            "Total_Glosa", "Qtd_Procedimentos",
+        ])
+
+    agg = orfas.groupby("__guia").agg(
+        Nome_Convenio=("__convenio", "first"),
+        Total_Repasse=("__repasse", "sum"),
+        Total_Glosa=("__glosa", "sum"),
+        Qtd_Procedimentos=("__guia", "size"),
+    ).reset_index().rename(columns={"__guia": "Numero_Guia"})
+
+    return agg[[
+        "Numero_Guia", "Nome_Convenio", "Total_Repasse",
+        "Total_Glosa", "Qtd_Procedimentos",
+    ]].sort_values("Numero_Guia").reset_index(drop=True)
+
+
 def tabela_glosas(quitacoes_df, diag):
     """Retorna DataFrame com 1 linha por procedimento glosado (Valor Glosa > 0)."""
     col_guia   = diag.get("col_guia_quitacao")
@@ -740,10 +815,12 @@ def tabela_glosas(quitacoes_df, diag):
     return out
 
 
-def gerar_xlsx_analise(envios_df, quitacoes_df, analise_df, meta, diag=None, glosas_df=None, prazos_df=None):
-    """Gera o XLSX da análise em memória (bytes) com até 6 abas: Resumo,
-    Análise, Glosas, Prazos, Envios, Quitações. Converte as colunas numéricas-chave
-    pra float nas abas Envios/Quitações pra permitir SOMA() no Excel."""
+def gerar_xlsx_analise(envios_df, quitacoes_df, analise_df, meta, diag=None,
+                       glosas_df=None, prazos_df=None, orfas_df=None):
+    """Gera o XLSX da análise em memória (bytes) com até 7 abas: Resumo,
+    Análise, Glosas, Prazos, Quitações órfãs, Envios, Quitações. Converte
+    colunas numéricas-chave pra float nas abas Envios/Quitações pra permitir
+    SOMA() no Excel."""
     diag = diag or {}
     envios_export    = envios_df.copy()
     quitacoes_export = quitacoes_df.copy()
@@ -755,6 +832,10 @@ def gerar_xlsx_analise(envios_df, quitacoes_df, analise_df, meta, diag=None, glo
     for c in [diag.get("col_repasse"), diag.get("col_glosa")]:
         if c and c in quitacoes_export.columns:
             quitacoes_export[c] = quitacoes_export[c].apply(_para_numero)
+
+    # Converte colunas que são datas pra datetime (Excel reconhece como data)
+    envios_export    = _converter_colunas_data(envios_export)
+    quitacoes_export = _converter_colunas_data(quitacoes_export)
 
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
@@ -787,8 +868,12 @@ def gerar_xlsx_analise(envios_df, quitacoes_df, analise_df, meta, diag=None, glo
             glosas_df.to_excel(writer, sheet_name="Glosas",    index=False)
         if prazos_df is not None and not prazos_df.empty:
             prazos_df.to_excel(writer, sheet_name="Prazos",    index=False)
+        if orfas_df is not None and not orfas_df.empty:
+            orfas_df.to_excel(writer,  sheet_name="Quitações órfãs", index=False)
         envios_export.to_excel(writer,    sheet_name="Envios",    index=False)
         quitacoes_export.to_excel(writer, sheet_name="Quitações", index=False)
+        _aplicar_formato_data_xlsx(writer, "Envios",    envios_export)
+        _aplicar_formato_data_xlsx(writer, "Quitações", quitacoes_export)
     return buf.getvalue()
 
 
@@ -2007,6 +2092,7 @@ elif st.session_state.step == "analise_processando":
             analise_df, diag   = cruzar_envios_quitacoes(envios_df, quitacoes_df)
             glosas_df          = tabela_glosas(quitacoes_df, diag)
             prazos_df          = tabela_prazos_por_convenio(quitacoes_df, diag)
+            orfas_df           = tabela_orfas(quitacoes_df, envios_df, diag)
 
             st.session_state.analise_envios_df    = envios_df
             st.session_state.analise_quitacoes_df = quitacoes_df
@@ -2014,6 +2100,7 @@ elif st.session_state.step == "analise_processando":
             st.session_state.analise_diag         = diag
             st.session_state.analise_glosas_df    = glosas_df
             st.session_state.analise_prazos_df    = prazos_df
+            st.session_state.analise_orfas_df     = orfas_df
             st.session_state.analise_pasta_tmp    = pasta_tmp
             st.session_state.step = "analise_done"
         except Exception as e:
@@ -2033,6 +2120,7 @@ elif st.session_state.step == "analise_done":
     quitacoes_df = st.session_state.analise_quitacoes_df
     glosas_df    = st.session_state.get("analise_glosas_df")
     prazos_df    = st.session_state.get("analise_prazos_df")
+    orfas_df     = st.session_state.get("analise_orfas_df")
     diag         = st.session_state.get("analise_diag", {})
     meta         = st.session_state.analise_meta
 
@@ -2054,6 +2142,15 @@ elif st.session_state.step == "analise_done":
         st.warning(
             f"⚠️ {diag['envios_duplicados']} envio(s) tinham número de guia "
             "repetido — os valores dessas guias foram somados na análise."
+        )
+
+    if orfas_df is not None and not orfas_df.empty:
+        soma_orfa = float(orfas_df["Total_Repasse"].sum())
+        st.warning(
+            f"⚠️ {len(orfas_df)} guia(s) da quitação não estão nos envios do "
+            f"período filtrado (vieram de envios anteriores) — total recebido: "
+            f"R$ {soma_orfa:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+            + ". Veja a aba 'Quitações órfãs' no XLSX."
         )
 
     c1, c2, c3, c4 = st.columns(4)
@@ -2090,9 +2187,16 @@ elif st.session_state.step == "analise_done":
         st.markdown(f"**Prazos médios por convênio ({len(prazos_df)} convênio(s)):**")
         st.dataframe(prazos_df, use_container_width=True, height=240)
 
+    if orfas_df is not None and not orfas_df.empty:
+        st.markdown(f"**Quitações órfãs ({len(orfas_df)} guia(s) sem envio no período):**")
+        st.dataframe(orfas_df, use_container_width=True, height=240)
+
     st.markdown("---")
     st.markdown("**Baixar resultados:**")
-    xlsx_bytes = gerar_xlsx_analise(envios_df, quitacoes_df, analise_df, meta, diag, glosas_df, prazos_df)
+    xlsx_bytes = gerar_xlsx_analise(
+        envios_df, quitacoes_df, analise_df, meta,
+        diag, glosas_df, prazos_df, orfas_df,
+    )
     json_bytes = gerar_json_analise(envios_df, quitacoes_df, analise_df, meta)
     cred_slug  = (meta.get("credenciado", "")[:6] or "cred").strip().replace(" ", "_")
     stamp      = datetime.now().strftime("%Y%m%d_%H%M")
@@ -2123,7 +2227,7 @@ elif st.session_state.step == "analise_done":
         limpar_pasta_tmp(st.session_state.get("analise_pasta_tmp"))
         for chave in [
             "analise_envios_df", "analise_quitacoes_df", "analise_resultado_df",
-            "analise_glosas_df", "analise_prazos_df", "analise_diag",
+            "analise_glosas_df", "analise_prazos_df", "analise_orfas_df", "analise_diag",
             "analise_meta", "analise_pasta_tmp", "analise_refs", "analise_celebrou",
         ]:
             st.session_state.pop(chave, None)
