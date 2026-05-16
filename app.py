@@ -539,14 +539,15 @@ def quitacoes_para_df(csv_paths):
 
 def cruzar_envios_quitacoes(envios_df, quitacoes_df):
     """
-    Cruza por número da guia. Retorna DataFrame com Numero_Guia,
-    Valor_Guia_Enviado, Total_Repasse, Diferenca, Qtd_Procedimentos,
-    Status e Detalhe_Glosas.
+    Cruza por número da guia. Retorna (analise_df, diag) onde:
+      analise_df tem Numero_Guia, Status, Valor_Guia_Enviado, Total_Repasse,
+                 Diferenca, Total_Glosa, Qtd_Procedimentos, Detalhe_Glosas
+      diag       tem nomes das colunas detectadas e contadores de duplicatas
     """
-    col_guia_env  = _encontrar_coluna(envios_df,    ["nº guia", "n guia", "num guia", "numero da guia", "guia"])
+    col_guia_env  = _encontrar_coluna(envios_df,    ["nº da guia", "nº guia", "n guia", "num guia", "numero da guia", "guia"])
     col_valor_env = _encontrar_coluna(envios_df,    ["valor da guia", "vlr guia", "vl guia", "valor total", "vlr total"])
-    col_guia_qit  = _encontrar_coluna(quitacoes_df, ["nº guia", "n guia", "num guia", "numero da guia", "guia"])
-    col_repasse   = _encontrar_coluna(quitacoes_df, ["valor do repasse", "vlr repasse", "vl repasse", "repasse"])
+    col_guia_qit  = _encontrar_coluna(quitacoes_df, ["nº da guia", "nº guia", "n guia", "num guia", "numero da guia", "guia"])
+    col_repasse   = _encontrar_coluna(quitacoes_df, ["valor do repasse", "vlr repasse", "vl repasse", "repasse ao", "repasse"])
     col_glosa     = _encontrar_coluna(quitacoes_df, ["valor da glosa", "vlr glosa", "vl glosa", "valor glosa", "glosa"])
     col_codigo    = _encontrar_coluna(quitacoes_df, ["código do serviço", "codigo do servico", "código", "codigo", "procedimento"])
     col_desc      = _encontrar_coluna(quitacoes_df, ["descrição do serviço", "descricao do servico", "descrição", "descricao"])
@@ -565,30 +566,39 @@ def cruzar_envios_quitacoes(envios_df, quitacoes_df):
     quitacoes_df["__repasse"] = quitacoes_df[col_repasse].apply(_para_numero) if col_repasse else 0.0
     quitacoes_df["__glosa"]   = quitacoes_df[col_glosa].apply(_para_numero)   if col_glosa   else 0.0
 
-    agg = quitacoes_df.groupby("__guia").agg(
+    qtd_envios_total = len(envios_df)
+    qtd_guias_unicas = envios_df["__guia"].nunique()
+    duplicadas       = qtd_envios_total - qtd_guias_unicas
+
+    agg_quit = quitacoes_df.groupby("__guia").agg(
         Total_Repasse=("__repasse", "sum"),
         Total_Glosa=("__glosa", "sum"),
         Qtd_Procedimentos=("__guia", "size"),
     ).reset_index()
 
-    # Detalhe das glosas: só os procedimentos com glosa > 0
+    # Detalhe das glosas: só procedimentos com glosa > 0
     detalhes_glosas = {}
     com_glosa = quitacoes_df[quitacoes_df["__glosa"] > 0.001]
     for guia, grupo in com_glosa.groupby("__guia"):
         partes = []
         for _, r in grupo.iterrows():
-            codigo = str(r[col_codigo]).strip() if col_codigo else ""
-            desc   = str(r[col_desc]).strip()   if col_desc   else ""
+            codigo   = str(r[col_codigo]).strip() if col_codigo else ""
+            desc     = str(r[col_desc]).strip()   if col_desc   else ""
             etiqueta = " ".join(p for p in [codigo, desc] if p)
-            valor = r["__glosa"]
+            valor    = r["__glosa"]
             valor_fmt = f"R$ {valor:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
             partes.append(f"{etiqueta}: {valor_fmt}" if etiqueta else valor_fmt)
         detalhes_glosas[guia] = " | ".join(partes)
 
-    resultado = envios_df[["__guia", "__valor_guia"]].rename(
-        columns={"__guia": "Numero_Guia", "__valor_guia": "Valor_Guia_Enviado"}
-    ).drop_duplicates(subset=["Numero_Guia"]).merge(
-        agg.rename(columns={"__guia": "Numero_Guia"}),
+    # Agrupa envios por guia somando o valor (em vez de drop_duplicates).
+    # Assim, se a mesma guia aparece em mais de um envio, soma os valores;
+    # a soma da aba Envios bate com a soma da Análise.
+    envios_agg = envios_df.groupby("__guia").agg(
+        Valor_Guia_Enviado=("__valor_guia", "sum"),
+    ).reset_index().rename(columns={"__guia": "Numero_Guia"})
+
+    resultado = envios_agg.merge(
+        agg_quit.rename(columns={"__guia": "Numero_Guia"}),
         on="Numero_Guia", how="left",
     )
 
@@ -607,16 +617,67 @@ def cruzar_envios_quitacoes(envios_df, quitacoes_df):
 
     resultado["Status"] = resultado.apply(_classificar, axis=1)
 
-    # Reordenar colunas pra ficar mais legivel no Excel
     resultado = resultado[[
         "Numero_Guia", "Status", "Valor_Guia_Enviado", "Total_Repasse",
         "Diferenca", "Total_Glosa", "Qtd_Procedimentos", "Detalhe_Glosas",
     ]]
-    return resultado
+
+    diag = {
+        "col_guia_envio":     col_guia_env,
+        "col_valor_envio":    col_valor_env,
+        "col_guia_quitacao":  col_guia_qit,
+        "col_repasse":        col_repasse,
+        "col_glosa":          col_glosa,
+        "col_codigo":         col_codigo,
+        "col_descricao":      col_desc,
+        "qtd_envios_total":   qtd_envios_total,
+        "qtd_guias_unicas":   qtd_guias_unicas,
+        "envios_duplicados":  duplicadas,
+    }
+    return resultado, diag
 
 
-def gerar_xlsx_analise(envios_df, quitacoes_df, analise_df, meta):
-    """Gera o XLSX da análise em memória (bytes), com 4 abas."""
+def tabela_glosas(quitacoes_df, diag):
+    """Retorna DataFrame com 1 linha por procedimento glosado (Valor Glosa > 0)."""
+    col_guia   = diag.get("col_guia_quitacao")
+    col_glosa  = diag.get("col_glosa")
+    col_codigo = diag.get("col_codigo")
+    col_desc   = diag.get("col_descricao")
+
+    if not col_glosa:
+        return pd.DataFrame(columns=["Numero_Guia", "Codigo", "Descricao", "Valor_Glosa"])
+
+    df = quitacoes_df.copy()
+    df["__glosa_num"] = df[col_glosa].apply(_para_numero)
+    df = df[df["__glosa_num"] > 0.001]
+    if df.empty:
+        return pd.DataFrame(columns=["Numero_Guia", "Codigo", "Descricao", "Valor_Glosa"])
+
+    out = pd.DataFrame({
+        "Numero_Guia": df[col_guia].astype(str).str.strip() if col_guia else "",
+        "Codigo":      df[col_codigo].astype(str).str.strip() if col_codigo else "",
+        "Descricao":   df[col_desc].astype(str).str.strip()   if col_desc   else "",
+        "Valor_Glosa": df["__glosa_num"],
+    }).reset_index(drop=True)
+    return out
+
+
+def gerar_xlsx_analise(envios_df, quitacoes_df, analise_df, meta, diag=None, glosas_df=None):
+    """Gera o XLSX da análise em memória (bytes) com até 5 abas: Resumo,
+    Análise, Glosas, Envios, Quitações. Converte as colunas numéricas-chave
+    pra float nas abas Envios/Quitações pra permitir SOMA() no Excel."""
+    diag = diag or {}
+    envios_export    = envios_df.copy()
+    quitacoes_export = quitacoes_df.copy()
+
+    # Converte colunas numéricas pra float (assim somam direito no Excel)
+    cv = diag.get("col_valor_envio")
+    if cv and cv in envios_export.columns:
+        envios_export[cv] = envios_export[cv].apply(_para_numero)
+    for c in [diag.get("col_repasse"), diag.get("col_glosa")]:
+        if c and c in quitacoes_export.columns:
+            quitacoes_export[c] = quitacoes_export[c].apply(_para_numero)
+
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         resumo = pd.DataFrame([
@@ -631,12 +692,23 @@ def gerar_xlsx_analise(envios_df, quitacoes_df, analise_df, meta):
             ["Pendentes",                    int((analise_df["Status"] == "Pendente").sum())],
             ["Valor total enviado (R$)",     round(float(analise_df["Valor_Guia_Enviado"].sum()), 2)],
             ["Valor total recebido (R$)",    round(float(analise_df["Total_Repasse"].sum()), 2)],
+            ["Total glosado (R$)",           round(float(analise_df["Total_Glosa"].sum()), 2)],
             ["Diferença total (R$)",         round(float(analise_df["Diferenca"].sum()), 2)],
+            ["", ""],
+            ["— Diagnóstico —", ""],
+            ["Coluna de Valor da Guia (envios)",     diag.get("col_valor_envio") or "(não detectada)"],
+            ["Coluna de Valor do Repasse (quit.)",   diag.get("col_repasse")     or "(não detectada)"],
+            ["Coluna de Valor da Glosa (quit.)",     diag.get("col_glosa")       or "(não detectada)"],
+            ["Linhas no relatório de envios",        diag.get("qtd_envios_total", 0)],
+            ["Guias únicas após agregação",          diag.get("qtd_guias_unicas", 0)],
+            ["Envios duplicados (mesma guia repete)", diag.get("envios_duplicados", 0)],
         ], columns=["Campo", "Valor"])
-        resumo.to_excel(writer,       sheet_name="Resumo",    index=False)
-        analise_df.to_excel(writer,   sheet_name="Análise",   index=False)
-        envios_df.to_excel(writer,    sheet_name="Envios",    index=False)
-        quitacoes_df.to_excel(writer, sheet_name="Quitações", index=False)
+        resumo.to_excel(writer,        sheet_name="Resumo",    index=False)
+        analise_df.to_excel(writer,    sheet_name="Análise",   index=False)
+        if glosas_df is not None and not glosas_df.empty:
+            glosas_df.to_excel(writer, sheet_name="Glosas",    index=False)
+        envios_export.to_excel(writer,    sheet_name="Envios",    index=False)
+        quitacoes_export.to_excel(writer, sheet_name="Quitações", index=False)
     return buf.getvalue()
 
 
@@ -898,6 +970,24 @@ def resetar_sessao():
 # ─── INTERFACE STREAMLIT ──────────────────────────────────────────
 
 st.set_page_config(page_title="Exportar Extrato AMHP", page_icon="📊", layout="centered")
+
+# Tentativa de forçar locale PT-BR no calendário do date_input.
+# O Streamlit não oferece API nativa pra isso; injetamos JS no documento pai
+# pra que widgets que respeitam o atributo `lang` mostrem meses em portugues.
+components.html(
+    """
+    <script>
+    try {
+        const doc = window.parent && window.parent.document;
+        if (doc && doc.documentElement) {
+            doc.documentElement.lang = 'pt-BR';
+            doc.documentElement.setAttribute('lang', 'pt-BR');
+        }
+    } catch (e) { /* silencioso */ }
+    </script>
+    """,
+    height=0,
+)
 
 st.markdown("""
 <style>
@@ -1832,13 +1922,16 @@ elif st.session_state.step == "analise_processando":
     else:
         _, envios_raw, csv_paths, pasta_tmp = resultado
         try:
-            envios_df    = envios_para_df(envios_raw)
-            quitacoes_df = quitacoes_para_df(csv_paths)
-            analise_df   = cruzar_envios_quitacoes(envios_df, quitacoes_df)
+            envios_df          = envios_para_df(envios_raw)
+            quitacoes_df       = quitacoes_para_df(csv_paths)
+            analise_df, diag   = cruzar_envios_quitacoes(envios_df, quitacoes_df)
+            glosas_df          = tabela_glosas(quitacoes_df, diag)
 
             st.session_state.analise_envios_df    = envios_df
             st.session_state.analise_quitacoes_df = quitacoes_df
             st.session_state.analise_resultado_df = analise_df
+            st.session_state.analise_diag         = diag
+            st.session_state.analise_glosas_df    = glosas_df
             st.session_state.analise_pasta_tmp    = pasta_tmp
             st.session_state.step = "analise_done"
         except Exception as e:
@@ -1856,6 +1949,8 @@ elif st.session_state.step == "analise_done":
     analise_df   = st.session_state.analise_resultado_df
     envios_df    = st.session_state.analise_envios_df
     quitacoes_df = st.session_state.analise_quitacoes_df
+    glosas_df    = st.session_state.get("analise_glosas_df")
+    diag         = st.session_state.get("analise_diag", {})
     meta         = st.session_state.analise_meta
 
     if not st.session_state.get("analise_celebrou"):
@@ -1872,6 +1967,12 @@ elif st.session_state.step == "analise_done":
 
     st.success(f"✅ Análise concluída! {total} guia(s) processada(s).")
 
+    if diag.get("envios_duplicados"):
+        st.warning(
+            f"⚠️ {diag['envios_duplicados']} envio(s) tinham número de guia "
+            "repetido — os valores dessas guias foram somados na análise."
+        )
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Total",      total)
     c2.metric("Quitadas",   quitadas)
@@ -1883,13 +1984,28 @@ elif st.session_state.step == "analise_done":
     c6.metric("Recebido (R$)",  f"{soma_rec:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
     c7.metric("Diferença (R$)", f"{soma_dif:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
 
+    with st.expander("🔎 Diagnóstico (colunas detectadas)"):
+        st.write({
+            "Valor da Guia (envios)":       diag.get("col_valor_envio")    or "❌ não detectada",
+            "Nº da Guia (envios)":          diag.get("col_guia_envio")     or "❌ não detectada",
+            "Nº da Guia (quitação)":        diag.get("col_guia_quitacao")  or "❌ não detectada",
+            "Valor do Repasse (quitação)":  diag.get("col_repasse")        or "❌ não detectada",
+            "Valor da Glosa (quitação)":    diag.get("col_glosa")          or "❌ não detectada",
+            "Código do Serviço (quitação)": diag.get("col_codigo")         or "❌ não detectada",
+            "Descrição do Serviço (quit.)": diag.get("col_descricao")      or "❌ não detectada",
+        })
+
     st.markdown("---")
     st.markdown("**Pré-visualização do resultado:**")
     st.dataframe(analise_df, use_container_width=True, height=320)
 
+    if glosas_df is not None and not glosas_df.empty:
+        st.markdown(f"**Glosas detalhadas ({len(glosas_df)} procedimento(s) glosado(s)):**")
+        st.dataframe(glosas_df, use_container_width=True, height=240)
+
     st.markdown("---")
     st.markdown("**Baixar resultados:**")
-    xlsx_bytes = gerar_xlsx_analise(envios_df, quitacoes_df, analise_df, meta)
+    xlsx_bytes = gerar_xlsx_analise(envios_df, quitacoes_df, analise_df, meta, diag, glosas_df)
     json_bytes = gerar_json_analise(envios_df, quitacoes_df, analise_df, meta)
     cred_slug  = (meta.get("credenciado", "")[:6] or "cred").strip().replace(" ", "_")
     stamp      = datetime.now().strftime("%Y%m%d_%H%M")
@@ -1920,6 +2036,7 @@ elif st.session_state.step == "analise_done":
         limpar_pasta_tmp(st.session_state.get("analise_pasta_tmp"))
         for chave in [
             "analise_envios_df", "analise_quitacoes_df", "analise_resultado_df",
+            "analise_glosas_df", "analise_diag",
             "analise_meta", "analise_pasta_tmp", "analise_refs", "analise_celebrou",
         ]:
             st.session_state.pop(chave, None)
