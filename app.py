@@ -13,15 +13,17 @@ import threading
 import queue
 import os
 import glob
+import io
 import json
 import platform
+import tempfile
 import time
 import re
 import urllib.parse
 import base64
 import pandas as pd
 import openpyxl
-from datetime import date
+from datetime import date, datetime
 from playwright.sync_api import sync_playwright
 
 
@@ -347,10 +349,11 @@ def selecionar_referencia(page, texto_referencia):
         pass
 
 
-def exportar_csv(page, texto_referencia, usuario):
+def exportar_csv(page, texto_referencia, usuario, pasta_destino=None):
     selecionar_referencia(page, texto_referencia)
     page.locator("#ctl00_MainContent_rbtExportarCsv_input").click()
 
+    destino = pasta_destino or PASTA_DESTINO
     caminho = None
     try:
         # Espera o iframe do popup aparecer — substitui a antiga pausa fixa de 2s.
@@ -372,7 +375,7 @@ def exportar_csv(page, texto_referencia, usuario):
             popup.locator("#rbtExportarCsv_input").click(timeout=10000)
 
         download = dl.value
-        os.makedirs(PASTA_DESTINO, exist_ok=True)
+        os.makedirs(destino, exist_ok=True)
         prefixo = ''.join(c for c in usuario if c.isdigit())[:6]
         nome = (prefixo + "_Extrato_"
                 + texto_referencia
@@ -381,7 +384,7 @@ def exportar_csv(page, texto_referencia, usuario):
                   .replace("â", "a").replace("ó", "o").replace("ô", "o")
                   .replace("ú", "u").replace("/", "_").replace(" ", "_")
                 + ".csv")
-        caminho = os.path.join(PASTA_DESTINO, nome)
+        caminho = os.path.join(destino, nome)
         download.save_as(caminho)
     finally:
         page.evaluate("document.querySelectorAll('[id^=\"RadWindowWrapper_\"], .TelerikModalOverlay').forEach(el => el.remove())")
@@ -479,6 +482,155 @@ def salvar_acompanhamento_xlsx(dados, credenciado, data_ini, data_fim):
         ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 50)
     wb.save(nome_arq)
     return nome_arq
+
+
+# ─── ANÁLISE: ENVIOS vs QUITAÇÕES ─────────────────────────────────
+
+def _encontrar_coluna(df, candidatos):
+    """Procura coluna por substring (case-insensitive). Retorna nome ou None."""
+    for col in df.columns:
+        col_norm = str(col).strip().lower()
+        for cand in candidatos:
+            if cand.lower() in col_norm:
+                return col
+    return None
+
+
+def _para_numero(valor):
+    """Converte string monetária brasileira em float; retorna 0.0 se inválido."""
+    if pd.isna(valor) or valor in (None, ""):
+        return 0.0
+    s = str(valor).strip().replace("R$", "").replace(" ", "")
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s:
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
+
+def envios_para_df(envios_raw):
+    """Converte a lista de listas vinda da página de Acompanhamento em DataFrame."""
+    if not envios_raw or len(envios_raw) < 2:
+        return pd.DataFrame()
+    header = envios_raw[0]
+    return pd.DataFrame(envios_raw[1:], columns=header)
+
+
+def quitacoes_para_df(csv_paths):
+    """Lê e concatena os CSVs de quitação em um único DataFrame."""
+    frames = []
+    for arq in csv_paths:
+        try:
+            df = pd.read_csv(arq, sep=";", encoding="latin1", dtype=str)
+            df["__Referencia"] = os.path.basename(arq).replace(".csv", "")
+            frames.append(df)
+        except Exception:
+            pass
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def cruzar_envios_quitacoes(envios_df, quitacoes_df):
+    """
+    Cruza por número da guia. Retorna DataFrame com Numero_Guia,
+    Valor_Guia_Enviado, Total_Repasse, Diferenca, Qtd_Procedimentos, Status.
+    """
+    col_guia_env  = _encontrar_coluna(envios_df,    ["guia"])
+    col_valor_env = _encontrar_coluna(envios_df,    ["valor da guia", "vl total", "valor total", "valor"])
+    col_guia_qit  = _encontrar_coluna(quitacoes_df, ["guia"])
+    col_repasse   = _encontrar_coluna(quitacoes_df, ["repasse"])
+
+    if not col_guia_env:
+        raise ValueError("Não consegui identificar a coluna de número da guia nos envios.")
+    if not col_guia_qit:
+        raise ValueError("Não consegui identificar a coluna de número da guia nas quitações.")
+
+    envios_df    = envios_df.copy()
+    quitacoes_df = quitacoes_df.copy()
+    envios_df["__guia"]    = envios_df[col_guia_env].astype(str).str.strip()
+    quitacoes_df["__guia"] = quitacoes_df[col_guia_qit].astype(str).str.strip()
+
+    envios_df["__valor_guia"] = envios_df[col_valor_env].apply(_para_numero) if col_valor_env else 0.0
+    quitacoes_df["__repasse"] = quitacoes_df[col_repasse].apply(_para_numero) if col_repasse else 0.0
+
+    agg = quitacoes_df.groupby("__guia").agg(
+        Total_Repasse=("__repasse", "sum"),
+        Qtd_Procedimentos=("__guia", "size"),
+    ).reset_index()
+
+    resultado = envios_df[["__guia", "__valor_guia"]].rename(
+        columns={"__guia": "Numero_Guia", "__valor_guia": "Valor_Guia_Enviado"}
+    ).drop_duplicates(subset=["Numero_Guia"]).merge(
+        agg.rename(columns={"__guia": "Numero_Guia"}),
+        on="Numero_Guia", how="left",
+    )
+
+    resultado["Total_Repasse"]     = resultado["Total_Repasse"].fillna(0.0)
+    resultado["Qtd_Procedimentos"] = resultado["Qtd_Procedimentos"].fillna(0).astype(int)
+    resultado["Diferenca"]         = resultado["Valor_Guia_Enviado"] - resultado["Total_Repasse"]
+
+    def _classificar(row):
+        if row["Qtd_Procedimentos"] == 0:
+            return "Pendente"
+        if abs(row["Diferenca"]) <= 0.01:
+            return "Quitada integralmente"
+        return "Quitada parcial (glosa)"
+
+    resultado["Status"] = resultado.apply(_classificar, axis=1)
+    return resultado
+
+
+def gerar_xlsx_analise(envios_df, quitacoes_df, analise_df, meta):
+    """Gera o XLSX da análise em memória (bytes), com 4 abas."""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        resumo = pd.DataFrame([
+            ["Credenciado",              meta.get("credenciado", "")],
+            ["Período de envio",         f"{meta.get('data_ini', '')} a {meta.get('data_fim', '')}"],
+            ["Referências de quitação",  ", ".join(meta.get("refs_quitacao", []))],
+            ["Gerado em",                meta.get("gerado_em", "")],
+            ["", ""],
+            ["Total de guias enviadas",      len(analise_df)],
+            ["Quitadas integralmente",       int((analise_df["Status"] == "Quitada integralmente").sum())],
+            ["Quitadas parcial (glosa)",     int((analise_df["Status"] == "Quitada parcial (glosa)").sum())],
+            ["Pendentes",                    int((analise_df["Status"] == "Pendente").sum())],
+            ["Valor total enviado (R$)",     round(float(analise_df["Valor_Guia_Enviado"].sum()), 2)],
+            ["Valor total recebido (R$)",    round(float(analise_df["Total_Repasse"].sum()), 2)],
+            ["Diferença total (R$)",         round(float(analise_df["Diferenca"].sum()), 2)],
+        ], columns=["Campo", "Valor"])
+        resumo.to_excel(writer,       sheet_name="Resumo",    index=False)
+        analise_df.to_excel(writer,   sheet_name="Análise",   index=False)
+        envios_df.to_excel(writer,    sheet_name="Envios",    index=False)
+        quitacoes_df.to_excel(writer, sheet_name="Quitações", index=False)
+    return buf.getvalue()
+
+
+def gerar_json_analise(envios_df, quitacoes_df, analise_df, meta):
+    """Gera JSON cru (bytes) com meta + dados crus + análise — útil pra migração futura."""
+    obj = {
+        "meta":      meta,
+        "envios":    envios_df.to_dict(orient="records"),
+        "quitacoes": quitacoes_df.to_dict(orient="records"),
+        "analise":   analise_df.to_dict(orient="records"),
+    }
+    return json.dumps(obj, ensure_ascii=False, indent=2, default=str).encode("utf-8")
+
+
+def limpar_pasta_tmp(pasta):
+    """Remove arquivos e a pasta temporária da análise. Tolera erros."""
+    if not pasta or not os.path.isdir(pasta):
+        return
+    try:
+        for arq in glob.glob(os.path.join(pasta, "*")):
+            try: os.remove(arq)
+            except Exception: pass
+        os.rmdir(pasta)
+    except Exception:
+        pass
 
 
 # ─── BROWSER ──────────────────────────────────────────────────────
@@ -608,6 +760,35 @@ def sessao_persistente_thread(usuario, senha, api_key, log_queue, cmd_queue):
                         else:
                             nome_arq = salvar_acompanhamento_xlsx(dados, credenciado, data_ini, data_fim)
                             log_queue.put(("ACOMPANHAMENTO_OK", nome_arq, len(dados) - 1))
+
+                    elif acao == "RODAR_ANALISE":
+                        _, credenciado, data_ini, data_fim, refs_quitacao = cmd
+
+                        log_queue.put("Etapa 1/2: buscando envios digitais...")
+                        envios_raw = buscar_acompanhamento(page, data_ini, data_fim, credenciado, log_queue)
+                        if not envios_raw or len(envios_raw) <= 1:
+                            log_queue.put(("ERRO_OPERACAO",
+                                "Nenhum envio encontrado para esse credenciado e período. "
+                                "Verifique as datas e tente novamente."))
+                        else:
+                            log_queue.put(f"Envios encontrados: {len(envios_raw) - 1} linha(s).")
+                            log_queue.put("Etapa 2/2: baixando quitações...")
+                            navegar_para_extrato(page, credenciado, log_queue)
+
+                            pasta_tmp = tempfile.mkdtemp(prefix="amhp_analise_")
+                            csv_paths = []
+                            total = len(refs_quitacao)
+                            for i, ref in enumerate(refs_quitacao):
+                                log_queue.put(f"  [{i+1}/{total}] Baixando {ref}...")
+                                try:
+                                    caminho = exportar_csv(page, ref, usuario, pasta_destino=pasta_tmp)
+                                    if caminho:
+                                        csv_paths.append(caminho)
+                                    time.sleep(0.5)
+                                except Exception as e:
+                                    log_queue.put(f"  Erro em {ref}: {e}")
+
+                            log_queue.put(("ANALISE_OK", envios_raw, csv_paths, pasta_tmp))
 
                     else:
                         log_queue.put(f"Comando desconhecido: {acao}")
@@ -1039,6 +1220,14 @@ elif st.session_state.step == "menu":
         st.session_state.step = "acomp_filtros"
         st.rerun()
 
+    if st.button("🔍 Análise: Envios vs Quitações", use_container_width=True, key="btn_analise", type="primary"):
+        st.session_state.fluxo_atual = "analise"
+        st.session_state.step = "analise_listando"
+        st.session_state.logs_acumulados = []
+        esvaziar_log_queue()
+        st.session_state.cmd_queue.put(("LISTAR_REFS_QUITACAO", st.session_state.credenciado_atual))
+        st.rerun()
+
     st.markdown("---")
 
     col1, col2 = st.columns(2)
@@ -1424,6 +1613,286 @@ elif st.session_state.step == "acomp_done":
         st.session_state.acomp_total   = 0
         st.session_state.pop("acomp_celebrou", None)
         st.session_state.step          = "menu"
+        st.rerun()
+
+
+# ──────────────────────────────────────────────────────────────────
+# TELA: Análise — buscando referências
+# ──────────────────────────────────────────────────────────────────
+elif st.session_state.step == "analise_listando":
+    banner_sessao_ativa()
+    log_queue = st.session_state.log_queue
+    thread    = st.session_state.browser_thread
+    ESTIMATIVA = 20
+
+    st.markdown("**Análise: Envios vs Quitações**")
+    st.caption("Buscando referências de quitação disponíveis...")
+    progress_bar = st.progress(0.0)
+    col_t, col_m = st.columns([1, 3])
+    timer_ph     = col_t.empty()
+    msg_ph       = col_m.empty()
+    status_ph    = st.empty()
+    botao_cancelar_operacao(key="cancel_analise_list")
+
+    start_time = time.time()
+    eventos    = []
+    logs       = st.session_state.logs_acumulados
+
+    refs, erro = None, None
+    while refs is None and erro is None:
+        elapsed = time.time() - start_time
+        progress_bar.progress(min(elapsed / ESTIMATIVA, 0.95))
+        timer_ph.metric("⏱", f"{int(elapsed)}s")
+        if elapsed < ESTIMATIVA:
+            msg_ph.caption(f"Tempo estimado: ~{ESTIMATIVA}s")
+        else:
+            msg_ph.caption("⚠️ Tá demorando mais que o normal...")
+
+        drenar_log_queue(log_queue, eventos, logs)
+        for ev in eventos:
+            if ev[0] == "REFERENCIAS":
+                refs = ev[1]
+            elif ev[0] in ("ERRO_OPERACAO", "ERRO_LOGIN"):
+                erro = ev[1]
+        eventos.clear()
+
+        if logs:
+            status_ph.info(logs[-1])
+
+        if refs is None and erro is None:
+            if not thread.is_alive():
+                erro = "A sessão encerrou inesperadamente."
+                break
+            time.sleep(0.2)
+
+    progress_bar.progress(1.0)
+
+    if erro:
+        st.session_state.erro = erro
+        st.session_state.step = "menu"
+    else:
+        st.session_state.analise_refs = refs
+        st.session_state.step = "analise_filtros"
+    st.rerun()
+
+
+# ──────────────────────────────────────────────────────────────────
+# TELA: Análise — filtros
+# ──────────────────────────────────────────────────────────────────
+elif st.session_state.step == "analise_filtros":
+    banner_sessao_ativa()
+    st.markdown("**Análise: Envios vs Quitações**")
+    st.caption(f"Credenciado: {st.session_state.credenciado_atual}")
+    st.info(
+        "Escolha o período dos envios digitais que você quer analisar e quais "
+        "referências de quitação cruzar. O resultado mostra, guia por guia, "
+        "o que já foi quitado, o que veio com glosa e o que ainda está pendente."
+    )
+
+    refs_disponiveis = st.session_state.get("analise_refs", [])
+    default_refs = refs_disponiveis[:2] if len(refs_disponiveis) >= 2 else refs_disponiveis
+
+    with st.form("analise_filtros_form"):
+        col_ini, col_fim = st.columns(2)
+        with col_ini:
+            data_ini_dt = st.date_input("Data Início (envio)", format="DD/MM/YYYY", value=date.today())
+        with col_fim:
+            data_fim_dt = st.date_input("Data Fim (envio)",    format="DD/MM/YYYY", value=date.today())
+
+        refs_escolhidas = st.multiselect(
+            "Referências de quitação a cruzar",
+            options=refs_disponiveis,
+            default=default_refs,
+            help="Inclua as referências que cobrem o período que você espera ter recebido. "
+                 "Recomendado: o mês do envio e os 1–2 seguintes.",
+        )
+
+        rodar = st.form_submit_button("Rodar análise", use_container_width=True, type="primary")
+
+    if st.button("← Voltar ao menu", use_container_width=True, key="voltar_analise_filtros", type="secondary"):
+        st.session_state.step = "menu"
+        st.rerun()
+
+    if rodar:
+        if data_ini_dt > data_fim_dt:
+            st.error("A Data Início não pode ser depois da Data Fim.")
+        elif not refs_escolhidas:
+            st.error("Selecione pelo menos uma referência de quitação.")
+        else:
+            data_ini = data_ini_dt.strftime("%d/%m/%Y")
+            data_fim = data_fim_dt.strftime("%d/%m/%Y")
+            st.session_state.analise_meta = {
+                "credenciado":    st.session_state.credenciado_atual,
+                "data_ini":       data_ini,
+                "data_fim":       data_fim,
+                "refs_quitacao":  refs_escolhidas,
+                "gerado_em":      datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+            }
+            st.session_state.logs_acumulados = []
+            esvaziar_log_queue()
+            st.session_state.cmd_queue.put((
+                "RODAR_ANALISE",
+                st.session_state.credenciado_atual,
+                data_ini, data_fim,
+                refs_escolhidas,
+            ))
+            st.session_state.step = "analise_processando"
+            st.rerun()
+
+
+# ──────────────────────────────────────────────────────────────────
+# TELA: Análise — processando
+# ──────────────────────────────────────────────────────────────────
+elif st.session_state.step == "analise_processando":
+    banner_sessao_ativa()
+    log_queue = st.session_state.log_queue
+    thread    = st.session_state.browser_thread
+    meta      = st.session_state.get("analise_meta", {})
+    qtd_refs  = len(meta.get("refs_quitacao", []))
+    ESTIMATIVA = 30 + 60 * qtd_refs  # envio + ~60s por referência
+
+    st.markdown("**Rodando análise...**")
+    st.caption(f"Período: {meta.get('data_ini')} a {meta.get('data_fim')} · "
+               f"{qtd_refs} referência(s) de quitação")
+    progress_bar = st.progress(0.0)
+    col_t, col_m = st.columns([1, 3])
+    timer_ph     = col_t.empty()
+    msg_ph       = col_m.empty()
+    log_ph       = st.empty()
+    botao_cancelar_operacao(key="cancel_analise_proc")
+
+    start_time = time.time()
+    eventos    = []
+    logs       = st.session_state.logs_acumulados
+    resultado, erro = None, None
+
+    while resultado is None and erro is None:
+        elapsed = time.time() - start_time
+        progress_bar.progress(min(elapsed / ESTIMATIVA, 0.95))
+        timer_ph.metric("⏱", f"{int(elapsed)}s")
+        if elapsed < ESTIMATIVA:
+            msg_ph.caption(f"Tempo estimado: ~{ESTIMATIVA}s")
+        else:
+            msg_ph.caption("⚠️ Tá demorando mais que o normal...")
+
+        drenar_log_queue(log_queue, eventos, logs)
+        for ev in eventos:
+            if ev[0] == "ANALISE_OK":
+                resultado = ev
+            elif ev[0] in ("ERRO_OPERACAO", "ERRO_LOGIN"):
+                erro = ev[1]
+        eventos.clear()
+
+        if logs:
+            log_ph.info(logs[-1])
+
+        if resultado is None and erro is None:
+            if not thread.is_alive():
+                erro = "A sessão encerrou inesperadamente."
+                break
+            time.sleep(0.3)
+
+    progress_bar.progress(1.0)
+
+    if erro:
+        st.session_state.erro = erro
+        st.session_state.step = "menu"
+        st.rerun()
+    else:
+        _, envios_raw, csv_paths, pasta_tmp = resultado
+        try:
+            envios_df    = envios_para_df(envios_raw)
+            quitacoes_df = quitacoes_para_df(csv_paths)
+            analise_df   = cruzar_envios_quitacoes(envios_df, quitacoes_df)
+
+            st.session_state.analise_envios_df    = envios_df
+            st.session_state.analise_quitacoes_df = quitacoes_df
+            st.session_state.analise_resultado_df = analise_df
+            st.session_state.analise_pasta_tmp    = pasta_tmp
+            st.session_state.step = "analise_done"
+        except Exception as e:
+            limpar_pasta_tmp(pasta_tmp)
+            st.session_state.erro = f"Erro ao cruzar os dados: {e}"
+            st.session_state.step = "menu"
+        st.rerun()
+
+
+# ──────────────────────────────────────────────────────────────────
+# TELA: Análise — resultado + downloads
+# ──────────────────────────────────────────────────────────────────
+elif st.session_state.step == "analise_done":
+    banner_sessao_ativa()
+    analise_df   = st.session_state.analise_resultado_df
+    envios_df    = st.session_state.analise_envios_df
+    quitacoes_df = st.session_state.analise_quitacoes_df
+    meta         = st.session_state.analise_meta
+
+    if not st.session_state.get("analise_celebrou"):
+        st.balloons()
+        st.session_state["analise_celebrou"] = True
+
+    total      = len(analise_df)
+    quitadas   = int((analise_df["Status"] == "Quitada integralmente").sum())
+    parciais   = int((analise_df["Status"] == "Quitada parcial (glosa)").sum())
+    pendentes  = int((analise_df["Status"] == "Pendente").sum())
+    soma_env   = float(analise_df["Valor_Guia_Enviado"].sum())
+    soma_rec   = float(analise_df["Total_Repasse"].sum())
+    soma_dif   = float(analise_df["Diferenca"].sum())
+
+    st.success(f"✅ Análise concluída! {total} guia(s) processada(s).")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total",      total)
+    c2.metric("Quitadas",   quitadas)
+    c3.metric("Parciais",   parciais)
+    c4.metric("Pendentes",  pendentes)
+
+    c5, c6, c7 = st.columns(3)
+    c5.metric("Enviado (R$)",   f"{soma_env:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+    c6.metric("Recebido (R$)",  f"{soma_rec:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+    c7.metric("Diferença (R$)", f"{soma_dif:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
+
+    st.markdown("---")
+    st.markdown("**Pré-visualização do resultado:**")
+    st.dataframe(analise_df, use_container_width=True, height=320)
+
+    st.markdown("---")
+    st.markdown("**Baixar resultados:**")
+    xlsx_bytes = gerar_xlsx_analise(envios_df, quitacoes_df, analise_df, meta)
+    json_bytes = gerar_json_analise(envios_df, quitacoes_df, analise_df, meta)
+    cred_slug  = (meta.get("credenciado", "")[:6] or "cred").strip().replace(" ", "_")
+    stamp      = datetime.now().strftime("%Y%m%d_%H%M")
+    nome_base  = f"Analise_{cred_slug}_{stamp}"
+
+    col_x, col_j = st.columns(2)
+    with col_x:
+        st.download_button(
+            label="⬇️ Baixar XLSX",
+            data=xlsx_bytes,
+            file_name=f"{nome_base}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+            key="dl_analise_xlsx",
+        )
+    with col_j:
+        st.download_button(
+            label="⬇️ Baixar JSON (dados crus)",
+            data=json_bytes,
+            file_name=f"{nome_base}.json",
+            mime="application/json",
+            use_container_width=True,
+            key="dl_analise_json",
+        )
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    if st.button("← Voltar ao menu", use_container_width=True, key="voltar_analise_done", type="primary"):
+        limpar_pasta_tmp(st.session_state.get("analise_pasta_tmp"))
+        for chave in [
+            "analise_envios_df", "analise_quitacoes_df", "analise_resultado_df",
+            "analise_meta", "analise_pasta_tmp", "analise_refs", "analise_celebrou",
+        ]:
+            st.session_state.pop(chave, None)
+        st.session_state.step = "menu"
         st.rerun()
 
 
