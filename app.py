@@ -408,8 +408,18 @@ def consolidar_excel(arquivos, usuario):
             frames.append(df)
         except Exception:
             pass
-    if frames:
-        pd.concat(frames, ignore_index=True).to_excel(nome_excel, index=False)
+    if not frames:
+        return nome_excel
+
+    consolidado = pd.concat(frames, ignore_index=True)
+    # Converte texto -> número/data pra que as células saiam com o formato
+    # correto no Excel (valores somáveis, datas ordenáveis), em vez de texto.
+    consolidado, cols_moeda, cols_data, _cols_qtd = _classificar_e_converter_quitacao(consolidado)
+
+    with pd.ExcelWriter(nome_excel, engine="openpyxl") as writer:
+        consolidado.to_excel(writer, index=False, sheet_name="Extratos")
+        _aplicar_formato_data_xlsx(writer, "Extratos", consolidado)
+        _aplicar_formato_colunas_xlsx(writer, "Extratos", consolidado, cols_moeda, 'R$ #,##0.00')
     return nome_excel
 
 
@@ -610,6 +620,80 @@ def _para_numero(valor):
         return float(s)
     except ValueError:
         return 0.0
+
+
+def _para_numero_nan(valor):
+    """Igual a _para_numero, mas devolve NaN (e não 0.0) para vazio/inválido,
+    pra célula ficar em branco no Excel em vez de virar zero indevidamente."""
+    if pd.isna(valor) or valor in (None, ""):
+        return float("nan")
+    s = str(valor).strip().replace("R$", "").replace(" ", "")
+    if not s:
+        return float("nan")
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".")
+    elif "," in s:
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except ValueError:
+        return float("nan")
+
+
+# Palavras-chave para detectar o tipo de cada coluna pelo nome (case-insensitive).
+# Conservador de propósito: na dúvida a coluna fica como texto.
+_PALAVRAS_DATA  = ["data", "atendimento", "entrega", "repasse ao",
+                   "realizacao", "realização", "vencimento",
+                   "emissao", "emissão"]
+_PALAVRAS_MOEDA = ["valor", "repasse", "glosa", "vlr", "desconto",
+                   "liquido", "líquido", "bruto"]
+_PALAVRAS_QTD   = ["quantidade", "qtde", "qtd", "quant"]
+
+
+def _aplicar_formato_colunas_xlsx(writer, sheet_name, df, colunas, number_format):
+    """Aplica um number_format do Excel às colunas informadas da worksheet."""
+    ws = writer.sheets.get(sheet_name)
+    if ws is None:
+        return
+    colunas = set(colunas)
+    for col_idx, col_name in enumerate(df.columns, start=1):
+        if col_name in colunas:
+            letter = get_column_letter(col_idx)
+            for row in range(2, len(df) + 2):
+                ws[f"{letter}{row}"].number_format = number_format
+
+
+def _classificar_e_converter_quitacao(df):
+    """Detecta, pelo nome da coluna, quais são datas / moeda / quantidade e
+    converte o texto pro tipo certo, pra que o Excel reconheça os valores.
+    A checagem de data vem primeiro (ex.: "Repasse ao Associado" é data, não
+    moeda). Retorna o DataFrame convertido e as listas de colunas de moeda,
+    data e quantidade."""
+    df = df.copy()
+    cols_moeda, cols_data, cols_qtd = [], [], []
+    total = len(df)
+    for col in df.columns:
+        nome = str(col).strip().lower()
+        # 1) Data — só efetiva se a maioria das células virou data válida.
+        if any(p in nome for p in _PALAVRAS_DATA):
+            convertido = df[col].apply(_para_data)
+            if total > 0 and convertido.notna().sum() >= 0.5 * total:
+                df[col] = convertido
+                cols_data.append(col)
+                continue
+        # 2) Moeda.
+        if any(p in nome for p in _PALAVRAS_MOEDA):
+            df[col] = df[col].apply(_para_numero_nan)
+            cols_moeda.append(col)
+            continue
+        # 3) Quantidade.
+        if any(p in nome for p in _PALAVRAS_QTD):
+            df[col] = pd.to_numeric(
+                df[col].astype(str).str.replace(",", ".", regex=False),
+                errors="coerce",
+            )
+            cols_qtd.append(col)
+    return df, cols_moeda, cols_data, cols_qtd
 
 
 def envios_para_df(envios_raw):
