@@ -414,12 +414,13 @@ def consolidar_excel(arquivos, usuario):
     consolidado = pd.concat(frames, ignore_index=True)
     # Converte texto -> número/data pra que as células saiam com o formato
     # correto no Excel (valores somáveis, datas ordenáveis), em vez de texto.
-    consolidado, cols_moeda, cols_data, _cols_qtd = _classificar_e_converter_quitacao(consolidado)
+    consolidado, cols_texto, cols_moeda, cols_data, _cols_qtd = _classificar_e_converter_quitacao(consolidado)
 
     with pd.ExcelWriter(nome_excel, engine="openpyxl") as writer:
         consolidado.to_excel(writer, index=False, sheet_name="Extratos")
         _aplicar_formato_data_xlsx(writer, "Extratos", consolidado)
-        _aplicar_formato_colunas_xlsx(writer, "Extratos", consolidado, cols_moeda, 'R$ #,##0.00')
+        _aplicar_formato_colunas_xlsx(writer, "Extratos", consolidado, cols_moeda, '#,##0.00')
+        _aplicar_formato_colunas_xlsx(writer, "Extratos", consolidado, cols_texto, '@')
     return nome_excel
 
 
@@ -642,6 +643,11 @@ def _para_numero_nan(valor):
 
 # Palavras-chave para detectar o tipo de cada coluna pelo nome (case-insensitive).
 # Conservador de propósito: na dúvida a coluna fica como texto.
+# _PALAVRAS_TEXTO tem prioridade: códigos/identificadores (ex.: "000121012")
+# precisam manter zeros à esquerda, então são forçados como texto no Excel.
+_PALAVRAS_TEXTO = ["codigo", "código", "procedimento", "guia",
+                   "matricula", "matrícula", "carteira", "carteirinha",
+                   "cpf", "cnpj", "registro"]
 _PALAVRAS_DATA  = ["data", "atendimento", "entrega", "repasse ao",
                    "realizacao", "realização", "vencimento",
                    "emissao", "emissão"]
@@ -670,10 +676,15 @@ def _classificar_e_converter_quitacao(df):
     moeda). Retorna o DataFrame convertido e as listas de colunas de moeda,
     data e quantidade."""
     df = df.copy()
-    cols_moeda, cols_data, cols_qtd = [], [], []
+    cols_texto, cols_moeda, cols_data, cols_qtd = [], [], [], []
     total = len(df)
     for col in df.columns:
         nome = str(col).strip().lower()
+        # 0) Identificadores (código, guia, etc.) — texto, pra manter zeros à
+        # esquerda. Tem prioridade sobre os outros tipos.
+        if any(p in nome for p in _PALAVRAS_TEXTO):
+            cols_texto.append(col)
+            continue
         # 1) Data — só efetiva se a maioria das células virou data válida.
         if any(p in nome for p in _PALAVRAS_DATA):
             convertido = df[col].apply(_para_data)
@@ -693,7 +704,7 @@ def _classificar_e_converter_quitacao(df):
                 errors="coerce",
             )
             cols_qtd.append(col)
-    return df, cols_moeda, cols_data, cols_qtd
+    return df, cols_texto, cols_moeda, cols_data, cols_qtd
 
 
 def envios_para_df(envios_raw):
