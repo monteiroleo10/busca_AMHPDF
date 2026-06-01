@@ -994,17 +994,16 @@ def gerar_xlsx_analise(envios_df, quitacoes_df, analise_df, meta, diag=None,
     envios_export    = envios_df.copy()
     quitacoes_export = quitacoes_df.copy()
 
-    # Converte colunas numéricas pra float (assim somam direito no Excel)
+    # Envios: converte valor pra float (soma direito no Excel) e datas pra datetime.
     cv = diag.get("col_valor_envio")
     if cv and cv in envios_export.columns:
         envios_export[cv] = envios_export[cv].apply(_para_numero)
-    for c in [diag.get("col_repasse"), diag.get("col_glosa")]:
-        if c and c in quitacoes_export.columns:
-            quitacoes_export[c] = quitacoes_export[c].apply(_para_numero)
+    envios_export = _converter_colunas_data(envios_export)
 
-    # Converte colunas que são datas pra datetime (Excel reconhece como data)
-    envios_export    = _converter_colunas_data(envios_export)
-    quitacoes_export = _converter_colunas_data(quitacoes_export)
+    # Quitações: mesma classificação do relatório consolidado — códigos viram
+    # texto (zeros à esquerda), valores viram número, datas viram data.
+    (quitacoes_export, q_cols_texto, q_cols_moeda,
+     q_cols_data, _q_cols_qtd) = _classificar_e_converter_quitacao(quitacoes_export)
 
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
@@ -1043,6 +1042,8 @@ def gerar_xlsx_analise(envios_df, quitacoes_df, analise_df, meta, diag=None,
         quitacoes_export.to_excel(writer, sheet_name="Quitações", index=False)
         _aplicar_formato_data_xlsx(writer, "Envios",    envios_export)
         _aplicar_formato_data_xlsx(writer, "Quitações", quitacoes_export)
+        _aplicar_formato_colunas_xlsx(writer, "Quitações", quitacoes_export, q_cols_moeda, '#,##0.00')
+        _aplicar_formato_colunas_xlsx(writer, "Quitações", quitacoes_export, q_cols_texto, '@')
     return buf.getvalue()
 
 
