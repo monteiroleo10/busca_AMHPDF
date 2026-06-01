@@ -8,33 +8,27 @@ jobs:
   monitor:
     runs-on: ubuntu-latest
     steps:
-      - name: Verifica status do deploy no Railway
+      - name: Verifica se o app está no ar
         env:
-          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
-          SERVICE_ID: ${{ secrets.RAILWAY_SERVICE_ID }}
+          APP_URL: https://amhpdf.b4strategy.com.br/
         run: |
           echo "🚀 Deploy iniciado — commit ${{ github.sha }}"
-          sleep 15
+          echo "⏳ Aguardando o Railway publicar a nova versão..."
+          sleep 30
 
-          for i in {1..12}; do
-            STATUS=$(curl -s -X POST https://backboard.railway.app/graphql/v2 \
-              -H "Authorization: Bearer $RAILWAY_TOKEN" \
-              -H "Content-Type: application/json" \
-              -d "{\"query\": \"{ deployments(input: { serviceId: \\\"$SERVICE_ID\\\" }) { edges { node { status createdAt } } } }\"}" \
-              | jq -r '.data.deployments.edges[0].node.status')
+          # Tenta acessar a URL pública do app por até ~5 minutos.
+          # Se o app responder HTTP 200, está no ar e o deploy deu certo.
+          for i in {1..20}; do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" --max-time 15 "$APP_URL" || echo "000")
+            echo "[$i/20] HTTP $CODE — $APP_URL"
 
-            echo "[$i/12] Status: $STATUS"
-
-            if [ "$STATUS" = "SUCCESS" ]; then
-              echo "✅ Deploy concluído!"
+            if [ "$CODE" = "200" ]; then
+              echo "✅ App no ar! (HTTP 200)"
               exit 0
-            elif [ "$STATUS" = "FAILED" ] || [ "$STATUS" = "CRASHED" ]; then
-              echo "❌ Deploy falhou: $STATUS"
-              exit 1
             fi
 
             sleep 15
           done
 
-          echo "⏱️ Timeout após 3 minutos"
+          echo "❌ App não respondeu HTTP 200 a tempo (último código: $CODE)"
           exit 1
