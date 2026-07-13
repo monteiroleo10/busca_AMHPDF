@@ -277,6 +277,20 @@ def obter_credenciados_disponiveis(page, log_queue):
     return credenciados
 
 
+def fechar_dropdowns_abertos(page):
+    """
+    Fecha qualquer lista suspensa (RadComboBox) que tenha ficado aberta na
+    tela. Uma lista aberta fica na frente dos outros campos e bloqueia os
+    cliques seguintes.
+    """
+    try:
+        if page.locator(".rcbSlide .rcbList li").first.is_visible():
+            page.keyboard.press("Escape")
+            page.wait_for_selector(".rcbSlide .rcbList li", state="hidden", timeout=5000)
+    except Exception:
+        pass
+
+
 def selecionar_credenciado_no_dropdown(page, credenciado, prefixo_id):
     """
     Seleciona um credenciado em um dropdown do tipo RadComboBox (Telerik).
@@ -287,14 +301,31 @@ def selecionar_credenciado_no_dropdown(page, credenciado, prefixo_id):
     dropdown_sel = f"#{prefixo_id}_DropDown .rcbList li"
 
     page.wait_for_selector(input_sel, timeout=15000)
-    page.locator(input_sel).click()
-    page.wait_for_selector(dropdown_sel, state="visible", timeout=10000)
-    page.locator(f"{dropdown_sel}:has-text('{codigo}')").first.click()
-    # Espera o dropdown fechar para confirmar que a seleção foi aceita.
-    try:
-        page.wait_for_selector(dropdown_sel, state="hidden", timeout=3000)
-    except Exception:
-        pass
+
+    # Em dias de portal lento, o clique no item pode não "pegar" ou a lista
+    # pode demorar a fechar. Tentamos algumas vezes antes de desistir.
+    ultimo_erro = None
+    for _ in range(3):
+        try:
+            if not page.locator(dropdown_sel).first.is_visible():
+                page.locator(input_sel).click()
+                page.wait_for_selector(dropdown_sel, state="visible", timeout=10000)
+            page.locator(f"{dropdown_sel}:has-text('{codigo}')").first.click(timeout=10000)
+            # A lista fechar é a confirmação de que a seleção foi aceita.
+            page.wait_for_selector(dropdown_sel, state="hidden", timeout=10000)
+            return
+        except Exception as e:
+            ultimo_erro = e
+            # Fecha o que ficou aberto e confere se, apesar do erro,
+            # a seleção chegou a entrar no campo.
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(1000)
+            try:
+                if codigo in page.locator(input_sel).input_value():
+                    return
+            except Exception:
+                pass
+    raise ultimo_erro
 
 
 # ─── QUITAÇÃO ─────────────────────────────────────────────────────
@@ -321,6 +352,7 @@ def navegar_para_extrato(page, credenciado, log_queue):
 
 def obter_referencias_disponiveis(page):
     """Lista as referências (meses) disponíveis para exportar."""
+    fechar_dropdowns_abertos(page)
     page.locator("#ctl00_MainContent_rcbReferencia_Input").click()
     page.wait_for_selector(
         "#ctl00_MainContent_rcbReferencia_DropDown .rcbList li",
@@ -336,6 +368,7 @@ def obter_referencias_disponiveis(page):
 
 
 def selecionar_referencia(page, texto_referencia):
+    fechar_dropdowns_abertos(page)
     page.locator("#ctl00_MainContent_rcbReferencia_Input").click()
     page.wait_for_selector(
         "#ctl00_MainContent_rcbReferencia_DropDown .rcbList li",
@@ -344,14 +377,16 @@ def selecionar_referencia(page, texto_referencia):
     page.locator(
         f"#ctl00_MainContent_rcbReferencia_DropDown .rcbList li:has-text('{texto_referencia}')"
     ).first.click(timeout=10000)
-    # Espera o dropdown fechar para confirmar a seleção.
+    # Espera o dropdown fechar para confirmar a seleção. Se não fechar
+    # sozinho (portal lento), fecha com Esc para não bloquear o botão
+    # de exportar logo em seguida.
     try:
         page.wait_for_selector(
             "#ctl00_MainContent_rcbReferencia_DropDown .rcbList li",
-            state="hidden", timeout=3000,
+            state="hidden", timeout=10000,
         )
     except Exception:
-        pass
+        page.keyboard.press("Escape")
 
 
 def exportar_csv(page, texto_referencia, usuario, pasta_destino=None):
