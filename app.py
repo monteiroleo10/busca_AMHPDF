@@ -432,9 +432,18 @@ def exportar_csv(page, texto_referencia, usuario, pasta_destino=None):
     return caminho
 
 
-def consolidar_excel(arquivos, usuario):
+def gerar_excel_quitacao(arquivos, usuario):
+    """Gera o XLSX dos extratos de quitação a partir dos CSVs baixados.
+
+    Com mais de um arquivo, sai o consolidado; com um só, sai o Excel do
+    próprio extrato (mesmo nome do CSV), com a mesma formatação de células.
+    """
     prefixo = ''.join(c for c in usuario if c.isdigit())[:6]
-    nome_excel = os.path.join(PASTA_DESTINO, f"{prefixo}_Extratos_Consolidado.xlsx")
+    if len(arquivos) == 1:
+        base = os.path.splitext(os.path.basename(arquivos[0]))[0]
+        nome_excel = os.path.join(PASTA_DESTINO, f"{base}.xlsx")
+    else:
+        nome_excel = os.path.join(PASTA_DESTINO, f"{prefixo}_Extratos_Consolidado.xlsx")
     frames = []
     for arq in arquivos:
         try:
@@ -1215,11 +1224,12 @@ def sessao_persistente_thread(usuario, senha, api_key, log_queue, cmd_queue):
                             except Exception as e:
                                 log_queue.put(f"  Erro em {ref}: {e}")
 
-                        # Só gera o consolidado quando há mais de 1 arquivo —
-                        # com um CSV só, o consolidado seria redundante.
-                        if len(arquivos) > 1:
-                            log_queue.put("Consolidando em Excel...")
-                            excel = consolidar_excel(arquivos, usuario)
+                        # Sempre entrega uma versão em Excel: consolidada
+                        # quando há vários CSVs, do próprio extrato quando é um só.
+                        if arquivos:
+                            log_queue.put("Gerando Excel..." if len(arquivos) == 1
+                                          else "Consolidando em Excel...")
+                            excel = gerar_excel_quitacao(arquivos, usuario)
                             arquivos.append(excel)
                         log_queue.put(("QUITACAO_OK", arquivos))
 
@@ -2085,9 +2095,10 @@ elif st.session_state.step == "quitacao_done":
                     key=f"dl_{os.path.basename(arq)}",
                 )
         if excel and os.path.exists(excel):
+            sufixo = " (consolidado)" if len(csvs) > 1 else ""
             with open(excel, "rb") as f:
                 st.download_button(
-                    label=f"⬇️ {os.path.basename(excel)} (consolidado)",
+                    label=f"⬇️ {os.path.basename(excel)}{sufixo}",
                     data=f.read(),
                     file_name=os.path.basename(excel),
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
