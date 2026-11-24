@@ -23,6 +23,7 @@ import urllib.parse
 import base64
 import pandas as pd
 import openpyxl
+from contextlib import ExitStack
 from openpyxl.utils import get_column_letter
 from datetime import date, datetime
 from playwright.sync_api import sync_playwright
@@ -1142,12 +1143,18 @@ def _criar_context(browser):
 #   ("ERRO_OPERACAO", msg_amigavel)
 #   ("ENCERRADA",)
 
+TEMPO_OCIOSO_SESSAO = 30 * 60
+
+
 def sessao_persistente_thread(usuario, senha, api_key, log_queue, cmd_queue):
     try:
         log_queue.put("Iniciando sessão...")
-        with sync_playwright() as p:
+        with sync_playwright() as p, ExitStack() as recursos:
             browser = _criar_browser(p)
-            page    = _criar_context(browser).new_page()
+            recursos.callback(browser.close)
+            contexto = _criar_context(browser)
+            recursos.callback(contexto.close)
+            page = contexto.new_page()
 
             # ── Login ───────────────────────────────────────────
             log_queue.put("Autenticando no portal AMHP...")
@@ -1155,7 +1162,6 @@ def sessao_persistente_thread(usuario, senha, api_key, log_queue, cmd_queue):
                 ok = login_com_2captcha(page, usuario, senha, api_key, log_queue)
             except Exception as e:
                 log_queue.put(("ERRO_LOGIN", classificar_erro_login(e)))
-                browser.close()
                 return
 
             if not ok:
@@ -1163,7 +1169,6 @@ def sessao_persistente_thread(usuario, senha, api_key, log_queue, cmd_queue):
                     "O login no portal AMHP não foi confirmado. "
                     "Pode ser CPF/CNPJ ou senha incorretos, ou o site pode estar instável. "
                     "Verifique seus dados e tente novamente."))
-                browser.close()
                 return
 
             # ── Coleta de credenciados ──────────────────────────
@@ -1174,7 +1179,6 @@ def sessao_persistente_thread(usuario, senha, api_key, log_queue, cmd_queue):
                 log_queue.put(("ERRO_LOGIN",
                     f"Login OK, mas não conseguimos carregar a lista de credenciados. "
                     f"Detalhes: {e}"))
-                browser.close()
                 return
 
             log_queue.put(f"{len(credenciados)} credenciado(s) encontrado(s).")
@@ -1182,7 +1186,11 @@ def sessao_persistente_thread(usuario, senha, api_key, log_queue, cmd_queue):
 
             # ── Loop de comandos ────────────────────────────────
             while True:
-                cmd = cmd_queue.get()
+                # O prazo começa entre comandos e preserva operações em curso.
+                try:
+                    cmd = cmd_queue.get(timeout=TEMPO_OCIOSO_SESSAO)
+                except queue.Empty:
+                    break
                 if cmd is None or (isinstance(cmd, tuple) and cmd and cmd[0] == "SAIR"):
                     break
 
@@ -1276,7 +1284,6 @@ def sessao_persistente_thread(usuario, senha, api_key, log_queue, cmd_queue):
                         f"A sessão continua ativa — você pode tentar de novo. "
                         f"Detalhes: {e}"))
 
-            browser.close()
         log_queue.put(("ENCERRADA",))
 
     except Exception as e:
@@ -1511,8 +1518,17 @@ def proteger_contra_fechar_aba():
     )
 
 
-def banner_sessao_ativa():
+def banner_sessao_ativa(requer_sessao=False):
     """Mostra um banner indicando que há uma sessão ativa no navegador."""
+    thread = st.session_state.get("browser_thread")
+    if thread is None or not thread.is_alive():
+        if requer_sessao:
+            st.session_state.erro = st.session_state.get("erro") or (
+                "A sessão do portal foi encerrada. Entre novamente para consultar o portal."
+            )
+            resetar_sessao()
+            st.rerun()
+        return
     proteger_contra_fechar_aba()
     cred = st.session_state.get("credenciado_atual")
     if cred:
@@ -1791,7 +1807,7 @@ elif st.session_state.step == "logando":
 # TELA: Escolher credenciado
 # ──────────────────────────────────────────────────────────────────
 elif st.session_state.step == "escolher_credenciado":
-    banner_sessao_ativa()
+    banner_sessao_ativa(requer_sessao=True)
     st.markdown(f"**{len(st.session_state.credenciados)} credenciado(s) disponível(is)**")
     st.caption("Escolha o credenciado para o qual você quer gerar relatórios.")
 
@@ -1818,7 +1834,7 @@ elif st.session_state.step == "escolher_credenciado":
 # TELA: Menu principal
 # ──────────────────────────────────────────────────────────────────
 elif st.session_state.step == "menu":
-    banner_sessao_ativa()
+    banner_sessao_ativa(requer_sessao=True)
 
     if st.session_state.get("erro"):
         st.error(st.session_state.pop("erro"))
@@ -1926,7 +1942,7 @@ elif st.session_state.step == "quitacao_listando":
 # TELA: Quitação — selecionar referências
 # ──────────────────────────────────────────────────────────────────
 elif st.session_state.step == "quitacao_selecionar":
-    banner_sessao_ativa()
+    banner_sessao_ativa(requer_sessao=True)
     st.markdown(f"**{len(st.session_state.referencias)} referência(s) disponível(is)**")
 
     # Inicializa a seleção uma única vez (primeira referência)
@@ -2109,7 +2125,7 @@ elif st.session_state.step == "quitacao_done":
 # TELA: Acompanhamento — filtros (datas)
 # ──────────────────────────────────────────────────────────────────
 elif st.session_state.step == "acomp_filtros":
-    banner_sessao_ativa()
+    banner_sessao_ativa(requer_sessao=True)
     st.markdown("**Acompanhamento de Envios Digitais**")
     st.caption(f"Credenciado: {st.session_state.credenciado_atual}")
     st.caption(
@@ -2311,7 +2327,7 @@ elif st.session_state.step == "analise_listando":
 # TELA: Análise — filtros
 # ──────────────────────────────────────────────────────────────────
 elif st.session_state.step == "analise_filtros":
-    banner_sessao_ativa()
+    banner_sessao_ativa(requer_sessao=True)
     st.markdown("**Análise: Envios vs Quitações**")
     st.caption(f"Credenciado: {st.session_state.credenciado_atual}")
     st.info(
